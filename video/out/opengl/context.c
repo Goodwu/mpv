@@ -19,6 +19,11 @@
 #include "context.h"
 #include "ra_gl.h"
 #include "utils.h"
+#ifdef __ANDROID__
+#include <dlfcn.h>
+#include <sys/system_properties.h>
+#include "osdep/timer.h"
+#endif
 
 // 0-terminated list of desktop GL versions a backend should try to
 // initialize. Each entry is the minimum required version.
@@ -232,7 +237,7 @@ bool ra_gl_ctx_submit_frame(struct ra_swapchain *sw, const struct vo_frame *fram
     if (p->opts->use_glfinish)
         gl->Finish();
 
-    if (gl->FenceSync) {
+    if (gl->FenceSync && p->params.swap_buffers) {
         GLsync fence = gl->FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         if (fence)
             MP_TARRAY_APPEND(p, p->vsync_fences, p->num_vsync_fences, fence);
@@ -269,8 +274,30 @@ void ra_gl_ctx_swap_buffers(struct ra_swapchain *sw)
 {
     struct priv *p = sw->priv;
     GL *gl = p->gl;
+#ifdef __ANDROID__
+    char p5_swap_prop[PROP_VALUE_MAX] = {0};
+    bool p5_swap_probe = __system_property_get("debug.media_kit.p5_swap_probe",
+                                               p5_swap_prop) > 0 &&
+                         p5_swap_prop[0] == '1';
+    char p5_finish_prop[PROP_VALUE_MAX] = {0};
+    bool p5_preswap_finish = p5_swap_probe &&
+        __system_property_get("debug.media_kit.p5_preswap_finish",
+                              p5_finish_prop) > 0 && p5_finish_prop[0] == '1';
+    int64_t p5_finish_start_ns = p5_swap_probe ? mp_time_ns() : 0;
+    int64_t p5_egl_start_ns = p5_finish_start_ns;
+    int64_t p5_egl_end_ns = 0, p5_fence_end_ns = 0;
+    int p5_fences_waited = 0;
+    if (p5_preswap_finish) {
+        gl->Finish();
+        p5_egl_start_ns = mp_time_ns();
+    }
+#endif
 
     p->params.swap_buffers(sw->ctx);
+#ifdef __ANDROID__
+    if (p5_swap_probe)
+        p5_egl_end_ns = mp_time_ns();
+#endif
     p->frames_rendered++;
 
     if (p->frames_rendered > 5 && !sw->ctx->opts.debug)
@@ -292,9 +319,32 @@ void ra_gl_ctx_swap_buffers(struct ra_swapchain *sw)
 
     while (p->num_vsync_fences >= sw->ctx->vo->opts->swapchain_depth) {
         gl->ClientWaitSync(p->vsync_fences[0], GL_SYNC_FLUSH_COMMANDS_BIT, 1e9);
+#ifdef __ANDROID__
+        if (p5_swap_probe)
+            p5_fences_waited++;
+#endif
         gl->DeleteSync(p->vsync_fences[0]);
         MP_TARRAY_REMOVE_AT(p->vsync_fences, p->num_vsync_fences, 0);
     }
+#ifdef __ANDROID__
+    if (p5_swap_probe &&
+        (p->frames_rendered <= 20 || p->frames_rendered % 50 == 0)) {
+        p5_fence_end_ns = mp_time_ns();
+        void *log_lib = dlopen("liblog.so", RTLD_NOW | RTLD_LOCAL);
+        typedef int (*log_print_fn)(int, const char *, const char *, ...);
+        log_print_fn log_print = log_lib ? dlsym(log_lib, "__android_log_print") : NULL;
+        if (log_print)
+            log_print(6, "P5_SWAP_SPLIT",
+                      "frame=%llu finish_us=%lld egl_us=%lld fence_us=%lld fences=%d depth=%d",
+                      (unsigned long long)p->frames_rendered,
+                      (long long)((p5_egl_start_ns - p5_finish_start_ns) / 1000),
+                      (long long)((p5_egl_end_ns - p5_egl_start_ns) / 1000),
+                      (long long)((p5_fence_end_ns - p5_egl_end_ns) / 1000),
+                      p5_fences_waited, sw->ctx->vo->opts->swapchain_depth);
+        if (log_lib)
+            dlclose(log_lib);
+    }
+#endif
 }
 
 static void ra_gl_ctx_get_vsync(struct ra_swapchain *sw,

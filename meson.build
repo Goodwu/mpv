@@ -1736,7 +1736,7 @@ endif
 
 # Set config.h
 conf_data = configuration_data()
-conf_data.set_quoted('CONFIGURATION', meson.build_options())
+conf_data.set_quoted('CONFIGURATION', '')
 conf_data.set_quoted('DEFAULT_OPTICAL_DEVICE', optical_device)
 
 # Loop over all features in the build, create a define and add them to config.h

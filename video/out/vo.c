@@ -16,12 +16,17 @@
  */
 
 #include <assert.h>
+#include <inttypes.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <sys/system_properties.h>
+#endif
 
 #include "mpv_talloc.h"
 
@@ -119,6 +124,52 @@ static const struct vo_driver *const video_out_drivers[] =
     &video_out_lavc,
 };
 
+#ifdef __ANDROID__
+struct p5_vo_time_summary {
+    int64_t count;
+    int64_t total_ns;
+    int64_t min_ns;
+    int64_t max_ns;
+    // CPU wall time buckets: <2, <4, <8, <16, <33, >=33 ms.
+    int64_t buckets[6];
+};
+
+struct p5_vo_summary {
+    bool enabled;
+    int64_t queued_frames;
+    int64_t expired_at_queue;
+    int64_t expired_between_queue_and_vo;
+    struct p5_vo_time_summary queue_wait;
+    int64_t deadline_drops;
+    int64_t other_drops;
+    int64_t accepted_draws;
+    int64_t late_draws;
+    struct p5_vo_time_summary deadline_late;
+    struct p5_vo_time_summary deadline_margin;
+    struct p5_vo_time_summary draw;
+    struct p5_vo_time_summary wait;
+    struct p5_vo_time_summary flip;
+};
+
+static void p5_vo_time_add(struct p5_vo_time_summary *s, int64_t ns)
+{
+    if (ns < 0)
+        return;
+    if (!s->count || ns < s->min_ns)
+        s->min_ns = ns;
+    if (ns > s->max_ns)
+        s->max_ns = ns;
+    s->count++;
+    s->total_ns += ns;
+    int bucket = ns < MP_TIME_MS_TO_NS(2) ? 0 :
+                 ns < MP_TIME_MS_TO_NS(4) ? 1 :
+                 ns < MP_TIME_MS_TO_NS(8) ? 2 :
+                 ns < MP_TIME_MS_TO_NS(16) ? 3 :
+                 ns < MP_TIME_MS_TO_NS(33) ? 4 : 5;
+    s->buckets[bucket]++;
+}
+#endif
+
 struct vo_internal {
     mp_thread thread;
     struct mp_dispatch_queue *dispatch;
@@ -170,6 +221,10 @@ struct vo_internal {
 
     bool rendering;                 // true if an image is being rendered
     struct vo_frame *frame_queued;  // should be drawn next
+#ifdef __ANDROID__
+    int64_t p5_frame_queued_at_ns; // protected by lock; sampled only when enabled
+    bool p5_frame_expired_at_queue;
+#endif
     int req_frames;                 // VO's requested value of num_frames
     uint64_t current_frame_id;
 
@@ -177,6 +232,9 @@ struct vo_internal {
     double reported_display_fps;
 
     struct stats_ctx *stats;
+#ifdef __ANDROID__
+    struct p5_vo_summary p5_summary; // written only by the VO thread
+#endif
 };
 
 extern const struct m_sub_options gl_video_conf;
@@ -880,6 +938,14 @@ void vo_queue_frame(struct vo *vo, struct vo_frame *frame)
     mp_assert(vo->config_ok && !in->frame_queued &&
            (!in->current_frame || in->current_frame->num_vsyncs < 1));
     in->hasframe = true;
+#ifdef __ANDROID__
+    if (in->p5_summary.enabled) {
+        int64_t queue_now = mp_time_ns();
+        in->p5_frame_queued_at_ns = queue_now;
+        in->p5_frame_expired_at_queue = frame->duration >= 0 &&
+            frame->pts + frame->duration < queue_now;
+    }
+#endif
     frame->frame_id = ++(in->current_frame_id);
     in->frame_queued = frame;
     in->wakeup_pts = frame->display_synced
@@ -933,6 +999,36 @@ static bool render_frame(struct vo *vo)
     mp_mutex_lock(&in->lock);
 
     if (in->frame_queued) {
+#ifdef __ANDROID__
+        if (in->p5_summary.enabled) {
+            int64_t dequeue_now = mp_time_ns();
+            struct p5_vo_summary *summary = &in->p5_summary;
+            summary->queued_frames++;
+            if (in->p5_frame_expired_at_queue)
+                summary->expired_at_queue++;
+            else if (in->frame_queued->duration >= 0 &&
+                     in->frame_queued->pts + in->frame_queued->duration < dequeue_now)
+                summary->expired_between_queue_and_vo++;
+            p5_vo_time_add(&summary->queue_wait,
+                           dequeue_now - in->p5_frame_queued_at_ns);
+            if (summary->queued_frames % 240 == 0) {
+                __android_log_print(ANDROID_LOG_INFO, "P5_VO_TICK",
+                    "queued=%"PRId64" draw=%"PRId64" deadline_drop=%"PRId64
+                    " other_drop=%"PRId64" expired_at_queue=%"PRId64
+                    " expired_before_vo=%"PRId64" draw_ms=%"PRId64
+                    " draw_max_ms=%"PRId64" wait_ms=%"PRId64
+                    " flip_ms=%"PRId64,
+                    summary->queued_frames, summary->accepted_draws,
+                    summary->deadline_drops, summary->other_drops,
+                    summary->expired_at_queue,
+                    summary->expired_between_queue_and_vo,
+                    summary->draw.total_ns / MP_TIME_MS_TO_NS(1),
+                    summary->draw.max_ns / MP_TIME_MS_TO_NS(1),
+                    summary->wait.total_ns / MP_TIME_MS_TO_NS(1),
+                    summary->flip.total_ns / MP_TIME_MS_TO_NS(1));
+            }
+        }
+#endif
         talloc_free(in->current_frame);
         in->current_frame = in->frame_queued;
         in->frame_queued = NULL;
@@ -955,6 +1051,15 @@ static bool render_frame(struct vo *vo)
     int64_t pts = frame->pts;
     int64_t duration = frame->duration;
     int64_t end_time = pts + duration;
+#ifdef __ANDROID__
+    struct p5_vo_summary *p5 = &in->p5_summary;
+    if (p5->enabled && duration >= 0) {
+        if (end_time < now)
+            p5_vo_time_add(&p5->deadline_late, now - end_time);
+        else
+            p5_vo_time_add(&p5->deadline_margin, end_time - now);
+    }
+#endif
 
     // Time at which we should flip_page on the VO.
     int64_t target = frame->display_synced ? 0 : pts - in->flip_queue_offset;
@@ -999,8 +1104,23 @@ static bool render_frame(struct vo *vo)
 
     if (in->dropped_frame) {
         in->drop_count += 1;
+#ifdef __ANDROID__
+        if (p5->enabled) {
+            if (duration >= 0 && end_time < now)
+                p5->deadline_drops++;
+            else
+                p5->other_drops++;
+        }
+#endif
         wakeup_core(vo);
     } else {
+#ifdef __ANDROID__
+        if (p5->enabled) {
+            p5->accepted_draws++;
+            if (duration >= 0 && end_time < now)
+                p5->late_draws++;
+        }
+#endif
         in->rendering = true;
         in->hasframe_rendered = true;
         int64_t prev_drop_count = vo->in->drop_count;
@@ -1015,15 +1135,36 @@ static bool render_frame(struct vo *vo)
 
         stats_time_start(in->stats, "video-draw");
 
+#ifdef __ANDROID__
+        int64_t p5_start_ns = p5->enabled ? mp_time_ns() : 0;
+#endif
         in->visible = vo->driver->draw_frame(vo, frame);
+#ifdef __ANDROID__
+        if (p5->enabled)
+            p5_vo_time_add(&p5->draw, mp_time_ns() - p5_start_ns);
+#endif
 
         stats_time_end(in->stats, "video-draw");
 
+#ifdef __ANDROID__
+        p5_start_ns = p5->enabled ? mp_time_ns() : 0;
+#endif
         wait_until(vo, target);
+#ifdef __ANDROID__
+        if (p5->enabled)
+            p5_vo_time_add(&p5->wait, mp_time_ns() - p5_start_ns);
+#endif
 
         stats_time_start(in->stats, "video-flip");
 
+#ifdef __ANDROID__
+        p5_start_ns = p5->enabled ? mp_time_ns() : 0;
+#endif
         vo->driver->flip_page(vo);
+#ifdef __ANDROID__
+        if (p5->enabled)
+            p5_vo_time_add(&p5->flip, mp_time_ns() - p5_start_ns);
+#endif
 
         struct vo_vsync_info vsync = {
             .last_queue_display_time = -1,
@@ -1130,6 +1271,13 @@ static MP_THREAD_VOID vo_thread(void *ptr)
     bool vo_paused = false;
 
     mp_thread_set_name("vo");
+#ifdef __ANDROID__
+    in->p5_summary = (struct p5_vo_summary){0};
+    char p5_property[PROP_VALUE_MAX] = {0};
+    in->p5_summary.enabled =
+        __system_property_get("debug.media_kit.p5_vo_summary", p5_property) > 0 &&
+        !strcmp(p5_property, "1");
+#endif
 
     if (vo->driver->get_image) {
         in->dr_helper = dr_helper_create(in->dispatch, get_image_vo, vo);
@@ -1226,6 +1374,62 @@ static MP_THREAD_VOID vo_thread(void *ptr)
     talloc_free(in->current_frame);
     in->current_frame = NULL;
     vo->driver->uninit(vo);
+#ifdef __ANDROID__
+    const struct p5_vo_summary *p5 = &in->p5_summary;
+    if (p5->enabled) {
+        __android_log_print(ANDROID_LOG_INFO, "P5_VO_TICK",
+            "final queued=%"PRId64" draw=%"PRId64" deadline_drop=%"PRId64
+            " other_drop=%"PRId64" expired_at_queue=%"PRId64
+            " expired_before_vo=%"PRId64" draw_ms=%"PRId64
+            " draw_max_ms=%"PRId64" wait_ms=%"PRId64
+            " flip_ms=%"PRId64,
+            p5->queued_frames, p5->accepted_draws,
+            p5->deadline_drops, p5->other_drops,
+            p5->expired_at_queue, p5->expired_between_queue_and_vo,
+            p5->draw.total_ns / MP_TIME_MS_TO_NS(1),
+            p5->draw.max_ns / MP_TIME_MS_TO_NS(1),
+            p5->wait.total_ns / MP_TIME_MS_TO_NS(1),
+            p5->flip.total_ns / MP_TIME_MS_TO_NS(1));
+        MP_ERR(vo, "P5_VO_SUMMARY diagnostic CPU-wall-ns (not GPU/display): "
+                "queued=%"PRId64" expired_at_queue=%"PRId64
+                " expired_queue_to_vo=%"PRId64
+                " queue_wait=count/total/min/max:%"PRId64"/%"PRId64"/%"PRId64"/%"PRId64
+                " hist:%"PRId64",%"PRId64",%"PRId64",%"PRId64",%"PRId64",%"PRId64
+                " "
+                "deadline_drops=%"PRId64" other_drops=%"PRId64
+                " draw_calls=%"PRId64" late_draws=%"PRId64
+                " late=count/total/max:%"PRId64"/%"PRId64"/%"PRId64
+                " margin=count/total/min:%"PRId64"/%"PRId64"/%"PRId64
+                " draw=count/total/min/max:%"PRId64"/%"PRId64"/%"PRId64"/%"PRId64
+                " hist[<2,<4,<8,<16,<33,>=33ms]:%"PRId64",%"PRId64",%"PRId64",%"PRId64",%"PRId64",%"PRId64
+                " wait=count/total/min/max:%"PRId64"/%"PRId64"/%"PRId64"/%"PRId64
+                " hist:%"PRId64",%"PRId64",%"PRId64",%"PRId64",%"PRId64",%"PRId64
+                " flip=count/total/min/max:%"PRId64"/%"PRId64"/%"PRId64"/%"PRId64
+                " hist:%"PRId64",%"PRId64",%"PRId64",%"PRId64",%"PRId64",%"PRId64"\n",
+                p5->queued_frames, p5->expired_at_queue,
+                p5->expired_between_queue_and_vo, p5->queue_wait.count,
+                p5->queue_wait.total_ns, p5->queue_wait.min_ns,
+                p5->queue_wait.max_ns, p5->queue_wait.buckets[0],
+                p5->queue_wait.buckets[1], p5->queue_wait.buckets[2],
+                p5->queue_wait.buckets[3], p5->queue_wait.buckets[4],
+                p5->queue_wait.buckets[5],
+                p5->deadline_drops, p5->other_drops, p5->accepted_draws,
+                p5->late_draws, p5->deadline_late.count,
+                p5->deadline_late.total_ns, p5->deadline_late.max_ns,
+                p5->deadline_margin.count, p5->deadline_margin.total_ns,
+                p5->deadline_margin.min_ns, p5->draw.count, p5->draw.total_ns,
+                p5->draw.min_ns, p5->draw.max_ns, p5->draw.buckets[0],
+                p5->draw.buckets[1], p5->draw.buckets[2], p5->draw.buckets[3],
+                p5->draw.buckets[4], p5->draw.buckets[5], p5->wait.count,
+                p5->wait.total_ns, p5->wait.min_ns, p5->wait.max_ns,
+                p5->wait.buckets[0], p5->wait.buckets[1], p5->wait.buckets[2],
+                p5->wait.buckets[3], p5->wait.buckets[4], p5->wait.buckets[5],
+                p5->flip.count, p5->flip.total_ns, p5->flip.min_ns,
+                p5->flip.max_ns, p5->flip.buckets[0], p5->flip.buckets[1],
+                p5->flip.buckets[2], p5->flip.buckets[3], p5->flip.buckets[4],
+                p5->flip.buckets[5]);
+    }
+#endif
 done:
     TA_FREEP(&in->dr_helper);
     MP_THREAD_RETURN();

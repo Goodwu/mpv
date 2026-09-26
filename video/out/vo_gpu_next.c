@@ -19,12 +19,20 @@
 
 #include <sys/stat.h>
 #include <time.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#include <dlfcn.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#endif
 
 #include <libplacebo/colorspace.h>
 #include <libplacebo/options.h>
 #include <libplacebo/renderer.h>
 #include <libplacebo/shaders/lut.h>
 #include <libplacebo/shaders/icc.h>
+#include <libplacebo/shaders/custom.h>
 #include <libplacebo/utils/libav.h>
 #include <libplacebo/utils/frame_queue.h>
 
@@ -36,6 +44,7 @@
 #include "options/path.h"
 #include "osdep/io.h"
 #include "osdep/threads.h"
+#include "osdep/timer.h"
 #include "stream/stream.h"
 #include "sub/draw_bmp.h"
 #include "video/fmt-conversion.h"
@@ -52,6 +61,15 @@
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
 #include <libplacebo/opengl.h>
 #include "video/out/opengl/ra_gl.h"
+#ifdef __ANDROID__
+#include <EGL/egl.h>
+#endif
+#ifndef GL_QUERY_COUNTER_BITS_EXT
+#define GL_QUERY_COUNTER_BITS_EXT 0x8864
+#endif
+#ifndef GL_GPU_DISJOINT_EXT
+#define GL_GPU_DISJOINT_EXT 0x8FBB
+#endif
 #endif
 
 #if HAVE_D3D11 && defined(PL_HAVE_D3D11)
@@ -92,6 +110,40 @@ struct frame_info {
     int count;
     struct pl_dispatch_info info[VO_PASS_PERF_MAX];
 };
+
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+struct p5_gpu_query {
+    GLuint start, end;
+    uint64_t frame;
+    bool pending, render_ok;
+};
+#endif
+
+static void p5_vo_log(const char *tag, const char *fmt, ...)
+{
+#ifdef __ANDROID__
+    void *lib = dlopen("liblog.so", RTLD_NOW | RTLD_LOCAL);
+    typedef int (*log_vprint_fn)(int, const char *, const char *, va_list);
+    log_vprint_fn log_vprint = lib ? dlsym(lib, "__android_log_vprint") : NULL;
+    if (log_vprint) {
+        va_list args;
+        va_start(args, fmt);
+        log_vprint(6, tag, fmt, args);
+        va_end(args);
+    }
+    if (lib)
+        dlclose(lib);
+#endif
+}
+
+#ifdef __ANDROID__
+static int64_t p5_thread_cpu_ns(void)
+{
+    struct timespec ts;
+    return clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0
+        ? (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec : 0;
+}
+#endif
 
 struct cache {
     struct mp_log *log;
@@ -134,6 +186,46 @@ struct priv {
     bool is_interpolated;
     bool want_reset;
     bool frame_pending;
+    bool p5_vo_perf;
+    uint64_t p5_vo_perf_seq;
+#ifdef __ANDROID__
+    bool p5_policy_logged;
+    bool p5_pass_identity;
+    uint64_t p5_pass_signatures[64];
+    int p5_pass_signature_count;
+    uint64_t p5_pass_callbacks, p5_pass_changes, p5_pass_overflow;
+    uint64_t p5_pass_last_signature;
+    bool p5_pass_last_valid;
+    bool p5_vo_cpu_wall;
+    bool p5_section_perf;
+    uint64_t p5_section_frames;
+    int64_t p5_render_wall_sum_ns, p5_render_cpu_sum_ns;
+    uint64_t p5_vo_cpu_wall_frames;
+    int64_t p5_draw_wall_sum_ns, p5_draw_cpu_sum_ns;
+    int64_t p5_flip_wall_sum_ns, p5_flip_cpu_sum_ns;
+    int64_t p5_submit_wall_sum_ns, p5_submit_cpu_sum_ns;
+    int64_t p5_swap_wall_sum_ns, p5_swap_cpu_sum_ns;
+    int64_t p5_draw_wall_max_ns, p5_flip_wall_max_ns;
+#endif
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+    bool p5_offscreen, p5_offscreen_check, p5_offscreen_half, p5_offscreen_native, p5_offscreen_float, p5_offscreen_ready;
+    bool p5_target_203, p5_target_pq;
+    bool p5_post_rpu_probe, p5_post_rpu_probe_done;
+    bool p5_post_rpu_full_dump;
+    bool p5_l2c_rgb_dump, p5_l2c_rgb_dump_done;
+    double p5_l2c_dump_pts;
+    struct pl_hook p5_l2c_rgb_hook;
+    pl_tex p5_offscreen_tex;
+    pl_tex p5_two_pass_tex;
+    struct pl_swapchain_frame p5_offscreen_frame;
+    struct mp_rect p5_offscreen_dst;
+    bool p5_offscreen_resize_reported;
+    uint64_t p5_offscreen_frames;
+    bool p5_gpu_timer_checked, p5_gpu_timer, p5_gpu_timer_full;
+    uint64_t p5_gpu_frame_seq, p5_gpu_missed, p5_gpu_disjoint;
+    int p5_gpu_next_slot;
+    struct p5_gpu_query p5_gpu_query[16];
+#endif
 
     pl_options pars;
     struct m_config_cache *opts_cache;
@@ -159,6 +251,60 @@ struct priv {
 
     struct mp_image_params target_params;
 };
+
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+static struct pl_hook_res p5_l2c_rgb_hook(void *priv,
+                                         const struct pl_hook_params *params)
+{
+    struct priv *p = priv;
+    struct pl_hook_res unchanged = { .output = PL_HOOK_SIG_NONE };
+    if (p->p5_l2c_rgb_dump_done)
+        return unchanged;
+    pl_tex src = params->tex;
+    if (!src || !src->params.blit_src ||
+        !(src->params.format->caps & PL_FMT_CAP_HOST_READABLE)) {
+        p5_vo_log("P5_L2C_RGB", "unsupported source pts=%.9f tex=%d blit_src=%d fmt=%s host_cap=%d",
+                  p->p5_l2c_dump_pts, !!src, src && src->params.blit_src,
+                  src ? src->params.format->name : "null",
+                  src && !!(src->params.format->caps & PL_FMT_CAP_HOST_READABLE));
+        return unchanged;
+    }
+
+    int w = src->params.w, h = src->params.h;
+    pl_fmt fmt = src->params.format;
+    size_t bytes = (size_t)w * h * fmt->texel_size;
+    pl_tex dst = pl_tex_create(params->gpu, pl_tex_params(
+        .w = w, .h = h, .format = fmt,
+        .host_readable = true, .blit_dst = true,
+    ));
+    void *pixels = bytes ? malloc(bytes) : NULL;
+    bool ok = false;
+    size_t written = 0;
+    if (dst && pixels) {
+        pl_tex_blit(params->gpu, pl_tex_blit_params(.src = src, .dst = dst));
+        ok = pl_tex_download(params->gpu, pl_tex_transfer_params(
+            .tex = dst, .ptr = pixels));
+        if (ok) {
+            FILE *file = fopen("/sdcard/Android/data/com.example.media_kit_test/files/p5-l2c-rgb.bin", "wb");
+            if (file) {
+                written = fwrite(pixels, 1, bytes, file);
+                fclose(file);
+            }
+        }
+    }
+    p5_vo_log("P5_L2C_RGB", "pts=%.9f w=%d h=%d fmt=%s texel=%d bytes=%zu written=%zu download=%d repr_sys=%d repr_levels=%d bits_color=%d bits_sample=%d primaries=%d transfer=%d rect=%.3f,%.3f,%.3f,%.3f",
+              p->p5_l2c_dump_pts, w, h, fmt->name, fmt->texel_size,
+              bytes, written, ok, params->repr.sys, params->repr.levels,
+              params->repr.bits.color_depth, params->repr.bits.sample_depth,
+              params->color.primaries, params->color.transfer,
+              params->rect.x0, params->rect.y0, params->rect.x1, params->rect.y1);
+    p->p5_l2c_rgb_dump_done = written == bytes;
+    free(pixels);
+    if (dst)
+        pl_tex_destroy(params->gpu, &dst);
+    return unchanged;
+}
+#endif
 
 static void update_render_options(struct vo *vo);
 static void update_lut(struct priv *p, struct user_lut *lut);
@@ -555,6 +701,9 @@ static pl_tex hwdec_get_tex(struct priv *p, int n)
         struct pl_opengl_wrap_params par = {
             .width = ratex->params.w,
             .height = ratex->params.h,
+            .sampler_type = ratex->params.external_yuv
+                          ? PL_SAMPLER_EXTERNAL_YUV
+                          : PL_SAMPLER_NORMAL,
         };
 
         ra_gl_get_format(ratex->params.format, &par.iformat,
@@ -660,6 +809,18 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
 
     mp_image_params_guess_csp(&par);
 
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+    static bool p5_gamut_source_logged;
+    if (!p5_gamut_source_logged && mpi->pts >= 10.0) {
+        p5_gamut_source_logged = true;
+        p5_vo_log("P5_GAMUT_SOURCE", "pts=%.9f src_fmt=%d src_sys=%d src_prim=%d src_trc=%d src_dovi=%d mapped_fmt=%d mapped_sys=%d mapped_prim=%d mapped_trc=%d mapped_dovi=%d",
+                  mpi->pts, mpi->params.imgfmt, mpi->params.repr.sys,
+                  mpi->params.color.primaries, mpi->params.color.transfer,
+                  !!mpi->params.repr.dovi, par.imgfmt, par.repr.sys,
+                  par.color.primaries, par.color.transfer, !!par.repr.dovi);
+    }
+#endif
+
     *frame = (struct pl_frame) {
         .color = par.color,
         .repr = par.repr,
@@ -670,6 +831,22 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
         .rotation = par.rotate / 90,
         .user_data = mpi,
     };
+
+#ifdef __ANDROID__
+    {
+        static int p5_probe_frames;
+        char property[PROP_VALUE_MAX] = { 0 };
+        if (p5_probe_frames < 5 &&
+            __system_property_get("debug.media_kit.p5_renderer_probe", property) > 0 &&
+            !strcmp(property, "1")) {
+            p5_probe_frames++;
+            MP_WARN(vo, "MEDIA_KIT_P5_RENDERER frame=%d source_fmt=%d source_sys=%d dovi=%d mapped_fmt=%d mapped_sys=%d mapped_dovi=%d final_sys=%d\n",
+                    p5_probe_frames, mpi->imgfmt, mpi->params.repr.sys,
+                    !!mpi->dovi, par.imgfmt, par.repr.sys, !!par.repr.dovi,
+                    frame->repr.sys);
+        }
+    }
+#endif
 
     const struct gl_video_opts *opts = p->opts_cache->opts;
     if (opts->hdr_reference_white && !pl_color_transfer_is_hdr(frame->color.transfer))
@@ -704,6 +881,21 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
                 }
                 map[index] = c;
             }
+        }
+        if (par.imgfmt == IMGFMT_YUV420_PACK10 && frame->num_planes == 2) {
+            struct pl_plane *uv = &frame->planes[1];
+            // The sidecar is RGB10_A2: R is unused, Cb/Cr occupy G/B.
+            uv->components = 3;
+            uv->component_mapping[0] = -1;
+            uv->component_mapping[1] = 1;
+            uv->component_mapping[2] = 2;
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+            if (mpi->pts >= 10.0 && mpi->pts < 10.2)
+                p5_vo_log("P5_420_FRAME", "pts=%.9f planes=%d uvmap=%d,%d,%d chroma_location=%d",
+                          mpi->pts, frame->num_planes,
+                          uv->component_mapping[0], uv->component_mapping[1],
+                          uv->component_mapping[2], par.chroma_location);
+#endif
         }
 
     } else { // swdec
@@ -795,6 +987,50 @@ static void info_callback(void *priv, const struct pl_render_info *info)
     struct priv *p = vo->priv;
     if (info->index >= VO_PASS_PERF_MAX)
         return; // silently ignore clipped passes, whatever
+
+#ifdef __ANDROID__
+    if (p->p5_pass_identity && p->p5_policy_logged &&
+        info->stage == PL_RENDER_STAGE_FRAME) {
+        const struct pl_dispatch_info *pass = info->pass;
+        p->p5_pass_callbacks++;
+        if (p->p5_pass_last_valid &&
+            p->p5_pass_last_signature != pass->signature)
+            p->p5_pass_changes++;
+        p->p5_pass_last_signature = pass->signature;
+        p->p5_pass_last_valid = true;
+        bool known = false;
+        for (int i = 0; i < p->p5_pass_signature_count; i++) {
+            if (p->p5_pass_signatures[i] == pass->signature) {
+                known = true;
+                break;
+            }
+        }
+        if (!known && p->p5_pass_signature_count < MP_ARRAY_SIZE(p->p5_pass_signatures)) {
+            p->p5_pass_signatures[p->p5_pass_signature_count++] = pass->signature;
+            p5_vo_log("P5_PASS_ID", "new=%d frame=%"PRIu64" index=%d signature=%016"PRIx64" desc=%s",
+                      p->p5_pass_signature_count, p->p5_pass_callbacks,
+                      info->index, pass->signature,
+                      pass->shader && pass->shader->description
+                          ? pass->shader->description : "unknown");
+        } else if (!known) {
+            p->p5_pass_overflow++;
+            if (p->p5_pass_overflow == 1)
+                p5_vo_log("P5_PASS_ID", "signature_limit=%d reached",
+                          (int)MP_ARRAY_SIZE(p->p5_pass_signatures));
+        }
+    }
+#endif
+
+    if (p->p5_vo_perf && info->stage == PL_RENDER_STAGE_FRAME &&
+        (p->p5_vo_perf_seq <= 20 || p->p5_vo_perf_seq % 50 == 0)) {
+        const struct pl_dispatch_info *pass = info->pass;
+        p5_vo_log("P5_GPU_PASS", "frame=%"PRIu64" index=%d signature=%016"PRIx64" samples=%d last_us=%"PRIu64" avg_us=%"PRIu64" peak_us=%"PRIu64" desc=%s",
+                  p->p5_vo_perf_seq, info->index, pass->signature, pass->num_samples,
+                  pass->last / 1000, pass->average / 1000,
+                  pass->peak / 1000,
+                  pass->shader && pass->shader->description
+                    ? pass->shader->description : "unknown");
+    }
 
     struct frame_info *frame;
     switch (info->stage) {
@@ -998,9 +1234,143 @@ static enum pl_color_primaries get_best_prim_container(const struct pl_raw_prima
 static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
                                      const struct mp_image *mpi);
 
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+static GL *p5_gpu_timer_gl(struct priv *p)
+{
+    struct ra *ra = p->ra_ctx ? p->ra_ctx->ra : NULL;
+    return ra && ra_is_gl(ra) ? ra_gl_get(ra) : NULL;
+}
+
+static void p5_gpu_timer_init(struct priv *p)
+{
+    if (p->p5_gpu_timer_checked)
+        return;
+    p->p5_gpu_timer_checked = true;
+    char property[PROP_VALUE_MAX] = {0};
+    if (__system_property_get("debug.media_kit.p5_vo_gpu_timer", property) <= 0 ||
+        strcmp(property, "1"))
+        return;
+
+    char full_property[PROP_VALUE_MAX] = {0};
+    p->p5_gpu_timer_full =
+        __system_property_get("debug.media_kit.p5_vo_gpu_timer_full",
+                              full_property) > 0 && !strcmp(full_property, "1");
+
+    GL *gl = p5_gpu_timer_gl(p);
+    typedef void (GLAPIENTRY *get_query_iv_fn)(GLenum, GLenum, GLint *);
+    get_query_iv_fn get_query_iv = (void *)eglGetProcAddress("glGetQueryivEXT");
+    GLint bits = 0;
+    if (gl && gl_check_extension(gl->extensions, "GL_EXT_disjoint_timer_query") &&
+        gl->GenQueries && gl->DeleteQueries && gl->QueryCounter &&
+        gl->GetQueryObjectuiv && gl->GetQueryObjectui64v && get_query_iv)
+        get_query_iv(GL_TIMESTAMP, GL_QUERY_COUNTER_BITS_EXT, &bits);
+    if (bits <= 0) {
+        p5_vo_log("P5_GPU_RANGE", "unavailable timestamp_bits=%d", bits);
+        return;
+    }
+    for (int n = 0; n < MP_ARRAY_SIZE(p->p5_gpu_query); n++) {
+        gl->GenQueries(1, &p->p5_gpu_query[n].start);
+        gl->GenQueries(1, &p->p5_gpu_query[n].end);
+        if (!p->p5_gpu_query[n].start || !p->p5_gpu_query[n].end) {
+            for (int i = 0; i <= n; i++) {
+                if (p->p5_gpu_query[i].start)
+                    gl->DeleteQueries(1, &p->p5_gpu_query[i].start);
+                if (p->p5_gpu_query[i].end)
+                    gl->DeleteQueries(1, &p->p5_gpu_query[i].end);
+                p->p5_gpu_query[i].start = p->p5_gpu_query[i].end = 0;
+            }
+            p5_vo_log("P5_GPU_RANGE", "unavailable query_allocation");
+            return;
+        }
+    }
+    p->p5_gpu_timer = true;
+    p5_vo_log("P5_GPU_RANGE", "enabled timestamp_bits=%d slots=%d scope=%s",
+              bits, (int)MP_ARRAY_SIZE(p->p5_gpu_query),
+              p->p5_gpu_timer_full ? "render_to_flush" : "render_only");
+}
+
+static void p5_gpu_timer_poll(struct priv *p)
+{
+    if (!p->p5_gpu_timer)
+        return;
+    GL *gl = p5_gpu_timer_gl(p);
+    GLint disjoint = 0;
+    gl->GetIntegerv(GL_GPU_DISJOINT_EXT, &disjoint);
+    for (int n = 0; n < MP_ARRAY_SIZE(p->p5_gpu_query); n++) {
+        struct p5_gpu_query *q = &p->p5_gpu_query[n];
+        if (!q->pending)
+            continue;
+        if (disjoint) {
+            q->pending = false;
+            p->p5_gpu_disjoint++;
+            continue;
+        }
+        GLuint available = 0;
+        gl->GetQueryObjectuiv(q->end, GL_QUERY_RESULT_AVAILABLE, &available);
+        if (!available)
+            continue;
+        GLuint64 start = 0, end = 0;
+        gl->GetQueryObjectui64v(q->start, GL_QUERY_RESULT, &start);
+        gl->GetQueryObjectui64v(q->end, GL_QUERY_RESULT, &end);
+        if (q->frame <= 20 || q->frame % 5 == 0)
+            p5_vo_log("P5_GPU_RANGE", "frame=%"PRIu64" gpu_us=%"PRIu64" render_ok=%d missed=%"PRIu64" disjoint=%"PRIu64,
+                      q->frame, end >= start ? (uint64_t)((end - start) / 1000) : 0,
+                      q->render_ok, p->p5_gpu_missed, p->p5_gpu_disjoint);
+        q->pending = false;
+    }
+}
+
+static int p5_gpu_timer_begin(struct priv *p)
+{
+    if (!p->p5_gpu_timer)
+        return -1;
+    GL *gl = p5_gpu_timer_gl(p);
+    for (int i = 0; i < MP_ARRAY_SIZE(p->p5_gpu_query); i++) {
+        int slot = (p->p5_gpu_next_slot + i) % MP_ARRAY_SIZE(p->p5_gpu_query);
+        if (!p->p5_gpu_query[slot].pending) {
+            p->p5_gpu_next_slot = (slot + 1) % MP_ARRAY_SIZE(p->p5_gpu_query);
+            p->p5_gpu_query[slot].frame = ++p->p5_gpu_frame_seq;
+            gl->QueryCounter(p->p5_gpu_query[slot].start, GL_TIMESTAMP);
+            return slot;
+        }
+    }
+    p->p5_gpu_missed++;
+    return -1;
+}
+
+static void p5_gpu_timer_end(struct priv *p, int slot, bool render_ok)
+{
+    if (slot < 0)
+        return;
+    GL *gl = p5_gpu_timer_gl(p);
+    gl->QueryCounter(p->p5_gpu_query[slot].end, GL_TIMESTAMP);
+    p->p5_gpu_query[slot].render_ok = render_ok;
+    p->p5_gpu_query[slot].pending = true;
+}
+#endif
+
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
+#ifdef __ANDROID__
+    int64_t p5_wall_start_ns = p->p5_vo_cpu_wall ? mp_time_ns() : 0;
+    int64_t p5_cpu_start_ns = p->p5_vo_cpu_wall ? p5_thread_cpu_ns() : 0;
+#endif
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+    p5_gpu_timer_init(p);
+    p5_gpu_timer_poll(p);
+#endif
+#ifdef __ANDROID__
+    if (!p->p5_vo_perf) {
+        char property[PROP_VALUE_MAX] = {0};
+        p->p5_vo_perf = __system_property_get("debug.media_kit.p5_vo_perf", property) > 0 &&
+                        !strcmp(property, "1");
+    }
+#endif
+    int64_t p5_draw_start_ns = p->p5_vo_perf ? mp_time_ns() : 0;
+    int64_t p5_render_start_ns = 0, p5_render_end_ns = 0;
+    if (p->p5_vo_perf)
+        p->p5_vo_perf_seq++;
     pl_options pars = p->pars;
     pl_gpu gpu = p->gpu;
     update_options(vo);
@@ -1235,8 +1605,25 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     }
 
     struct pl_swapchain_frame swframe;
-    bool should_draw = sw->fns->start_frame(sw, NULL); // for wayland logic
-    if (!should_draw || !pl_swapchain_start_frame(p->sw, &swframe)) {
+    bool should_draw = true;
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+    if (p->p5_offscreen && p->p5_offscreen_ready) {
+        if (!p->p5_offscreen_native &&
+            memcmp(&p->p5_offscreen_dst, &p->dst, sizeof(p->dst))) {
+            if (!p->p5_offscreen_resize_reported)
+                p5_vo_log("P5_OFFSCREEN", "dst_changed; diagnostic invalid after resize");
+            p->p5_offscreen_resize_reported = true;
+            return VO_FALSE;
+        }
+        swframe = p->p5_offscreen_frame;
+    } else
+#endif
+    {
+        should_draw = sw->fns->start_frame(sw, NULL); // for wayland logic
+        if (should_draw)
+            should_draw = pl_swapchain_start_frame(p->sw, &swframe);
+    }
+    if (!should_draw) {
         if (frame->current) {
             // Advance the queue state to the current PTS to discard unused frames
             struct pl_queue_params qparams = *pl_queue_params(
@@ -1251,15 +1638,86 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         }
         return VO_FALSE;
     }
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+    if (p->p5_offscreen && !p->p5_offscreen_ready &&
+        (!p->p5_offscreen_native ||
+         (frame->current && frame->current->params.w >= 256 &&
+          frame->current->params.h >= 144))) {
+        // Pair the one bootstrap start with submit, then stop using the window
+        // swapchain. Rendering below targets a real, host-readable GPU texture.
+        pl_fmt window_fmt = swframe.fbo ? swframe.fbo->params.format : NULL;
+        int depth = window_fmt ? window_fmt->component_depth[0] : 0;
+        bool submitted = pl_swapchain_submit_frame(p->sw);
+        pl_fmt fmt = depth == 8 ? pl_find_fmt(gpu,
+            p->p5_offscreen_float ? PL_FMT_FLOAT : PL_FMT_UNORM, 4,
+            p->p5_offscreen_float ? 16 : 8,
+            p->p5_offscreen_float ? 16 : 8,
+            PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_HOST_READABLE) : NULL;
+        if (!submitted || !fmt) {
+            p5_vo_log("P5_OFFSCREEN", "bootstrap_failed submitted=%d window_fmt=%s depth=%d",
+                      submitted, window_fmt ? window_fmt->name : "unknown", depth);
+            return VO_FALSE;
+        }
+        int off_w = p->p5_offscreen_native && frame->current ? frame->current->params.w :
+                    swframe.fbo->params.w / (p->p5_offscreen_half ? 2 : 1);
+        int off_h = p->p5_offscreen_native && frame->current ? frame->current->params.h :
+                    swframe.fbo->params.h / (p->p5_offscreen_half ? 2 : 1);
+        p->p5_offscreen_tex = pl_tex_create(gpu, pl_tex_params(
+            .w = off_w,
+            .h = off_h,
+            .format = fmt,
+            .renderable = true,
+            .blit_dst = true,
+            .host_readable = true,
+        ));
+        if (!p->p5_offscreen_tex) {
+            p5_vo_log("P5_OFFSCREEN", "create_failed w=%d h=%d fmt=%s",
+                      swframe.fbo->params.w, swframe.fbo->params.h, fmt->name);
+            return VO_FALSE;
+        }
+        p5_vo_log("P5_OFFSCREEN", "bootstrap window_w=%d window_h=%d off_w=%d off_h=%d window_fmt=%s window_depth=%d off_fmt=%s dst=%d,%d,%d,%d flipped=%d",
+                  swframe.fbo->params.w, swframe.fbo->params.h,
+                  p->p5_offscreen_tex->params.w, p->p5_offscreen_tex->params.h,
+                  swframe.fbo->params.format->name, depth, fmt->name,
+                  p->dst.x0, p->dst.y0, p->dst.x1, p->dst.y1,
+                  swframe.flipped);
+        swframe.fbo = p->p5_offscreen_tex;
+        p->p5_offscreen_frame = swframe;
+        p->p5_offscreen_dst = p->dst;
+        p->p5_offscreen_ready = true;
+    }
+#endif
 
     bool valid = false;
     p->is_interpolated = false;
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+    int p5_gpu_slot = -1;
+#endif
+    bool p5_render_ok = false;
 
     // Calculate target
     struct pl_frame target;
     pl_frame_from_swapchain(&target, &swframe);
     bool strict_sw_params = target_hint && !pass_colorspace && p->next_opts->target_hint_strict;
     apply_target_options(p, &target, hint.hdr.min_luma, strict_sw_params);
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+    if (p->p5_target_203)
+        target.color.hdr.max_luma = 203.0f;
+    if (p->p5_target_pq && frame->current &&
+        frame->current->params.dv_profile == 5) {
+        target.color.primaries = PL_COLOR_PRIM_BT_2020;
+        target.color.transfer = PL_COLOR_TRC_PQ;
+        target.color.hdr.min_luma = 0.0f;
+        target.color.hdr.max_luma = 1000.0f;
+        target.color.hdr.max_cll = 0.0f;
+        target.color.hdr.max_fall = 0.0f;
+    }
+    char p5_target_2020_property[PROP_VALUE_MAX] = {0};
+    if (__system_property_get("debug.media_kit.p5_target_2020",
+                              p5_target_2020_property) > 0 &&
+        !strcmp(p5_target_2020_property, "1"))
+        target.color.primaries = PL_COLOR_PRIM_BT_2020;
+#endif
     if (target.color.transfer == PL_COLOR_TRC_SRGB && frame->current &&
         ((opts->sdr_adjust_gamma == 0 && opts->target_trc == PL_COLOR_TRC_UNKNOWN) ||
          opts->sdr_adjust_gamma == -1))
@@ -1302,7 +1760,26 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     update_overlays(vo, p->osd_res,
                     (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,
                     PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, frame->current);
-    apply_crop(&target, p->dst, swframe.fbo->params.w, swframe.fbo->params.h);
+    struct mp_rect p5_target_dst = p->dst;
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+    if (p->p5_offscreen && p->p5_offscreen_half) {
+        p5_target_dst.x0 /= 2;
+        p5_target_dst.y0 /= 2;
+        p5_target_dst.x1 /= 2;
+        p5_target_dst.y1 /= 2;
+    }
+    if (p->p5_offscreen && p->p5_offscreen_native) {
+        p5_target_dst = (struct mp_rect){0, 0, swframe.fbo->params.w,
+                                         swframe.fbo->params.h};
+    }
+#endif
+    apply_crop(&target, p5_target_dst, swframe.fbo->params.w, swframe.fbo->params.h);
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+    if (p->p5_offscreen && p->p5_offscreen_frames == 0)
+        p5_vo_log("P5_OFFSCREEN", "target crop=%.0f,%.0f,%.0f,%.0f repr=%d primaries=%d transfer=%d",
+                  target.crop.x0, target.crop.y0, target.crop.x1, target.crop.y1,
+                  target.repr.sys, target.color.primaries, target.color.transfer);
+#endif
     update_tm_viz(&pars->color_map_params, &target);
 
     struct pl_frame_mix mix = {0};
@@ -1400,10 +1877,459 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     }
 
     // Render frame
-    if (!pl_render_image_mix(p->rr, &mix, &target, &params)) {
+    if (p->p5_vo_perf)
+        p5_render_start_ns = mp_time_ns();
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+    p5_gpu_slot = p5_gpu_timer_begin(p);
+    struct pl_color_map_params p5_sdr_color_map;
+    if (frame->current && frame->current->params.dv_profile == 5 &&
+        frame->current->params.repr.dovi &&
+        target.color.transfer == PL_COLOR_TRC_BT_1886 &&
+        params.color_map_params) {
+        p5_sdr_color_map = *params.color_map_params;
+        p5_sdr_color_map.gamut_mapping = &pl_gamut_map_clip;
+        params.color_map_params = &p5_sdr_color_map;
+    }
+    if (!p->p5_policy_logged && frame->current &&
+        frame->current->params.dv_profile == 5 && mix.num_frames == 1 &&
+        params.color_map_params) {
+        p->p5_policy_logged = true;
+        const struct pl_frame *source = mix.frames[0];
+        if (p->p5_pass_identity) {
+            const pl_tex src = source->planes[0].texture;
+            const pl_tex dst = target.planes[0].texture;
+            p5_vo_log("P5_PASS_TARGET", "src_tex=%dx%d src_fmt=%s dst_tex=%dx%d dst_fmt=%s dst_crop=%.1f,%.1f,%.1f,%.1f",
+                      src ? src->params.w : 0, src ? src->params.h : 0,
+                      src && src->params.format ? src->params.format->name : "none",
+                      dst ? dst->params.w : 0, dst ? dst->params.h : 0,
+                      dst && dst->params.format ? dst->params.format->name : "none",
+                      target.crop.x0, target.crop.y0, target.crop.x1, target.crop.y1);
+        }
+        const struct pl_color_map_params *map = params.color_map_params;
+        const struct pl_peak_detect_params *peak = params.peak_detect_params;
+        float source_min = 0, source_max = 0, target_min = 0, target_max = 0;
+        pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
+            .color = &source->color, .metadata = map->metadata,
+            .scaling = PL_HDR_NITS, .out_min = &source_min,
+            .out_max = &source_max));
+        pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
+            .color = &target.color, .metadata = PL_HDR_METADATA_HDR10,
+            .scaling = PL_HDR_NITS, .out_min = &target_min,
+            .out_max = &target_max));
+        p5_vo_log("P5_POLICY", "color source_sys=%d source_prim=%d source_trc=%d source_hdr_min=%.5f source_hdr_max=%.5f source_max_cll=%.5f source_nominal_nits=%.5f:%.5f target_prim=%d target_trc=%d target_hdr_min=%.5f target_hdr_max=%.5f target_nominal_nits=%.5f:%.5f",
+                  source->repr.sys, source->color.primaries,
+                  source->color.transfer, source->color.hdr.min_luma,
+                  source->color.hdr.max_luma, source->color.hdr.max_cll,
+                  source_min, source_max, target.color.primaries,
+                  target.color.transfer, target.color.hdr.min_luma,
+                  target.color.hdr.max_luma, target_min, target_max);
+AV_NOWARN_DEPRECATED(
+        p5_vo_log("P5_POLICY", "map tone=%s tone_param=%.5f gamut=%s gamut_mode=%d intent=%d metadata=%d lut_size=%d lut3d=%d,%d,%d tricubic=%d gamut_expansion=%d inverse=%d contrast_recovery=%.5f contrast_smoothness=%.5f force_lut=%d visualize=%d show_clipping=%d",
+                  map->tone_mapping_function ? map->tone_mapping_function->name : "default",
+                  map->tone_mapping_param,
+                  map->gamut_mapping ? map->gamut_mapping->name : "default",
+                  map->gamut_mode, map->intent, map->metadata,
+                  map->lut_size, map->lut3d_size[0],
+                  map->lut3d_size[1], map->lut3d_size[2],
+                  map->lut3d_tricubic, map->gamut_expansion,
+                  map->inverse_tone_mapping, map->contrast_recovery,
+                  map->contrast_smoothness, map->force_tone_mapping_lut,
+                  map->visualize_lut, map->show_clipping);
+)
+        p5_vo_log("P5_POLICY", "tone_constants knee_adaptation=%.5f knee_minimum=%.5f knee_maximum=%.5f knee_default=%.5f knee_offset=%.5f slope_tuning=%.5f slope_offset=%.5f spline_contrast=%.5f reinhard_contrast=%.5f linear_knee=%.5f exposure=%.5f",
+                  map->tone_constants.knee_adaptation,
+                  map->tone_constants.knee_minimum,
+                  map->tone_constants.knee_maximum,
+                  map->tone_constants.knee_default,
+                  map->tone_constants.knee_offset,
+                  map->tone_constants.slope_tuning,
+                  map->tone_constants.slope_offset,
+                  map->tone_constants.spline_contrast,
+                  map->tone_constants.reinhard_contrast,
+                  map->tone_constants.linear_knee,
+                  map->tone_constants.exposure);
+        p5_vo_log("P5_POLICY", "gamut_constants perceptual_deadzone=%.5f perceptual_strength=%.5f colorimetric_gamma=%.5f softclip_knee=%.5f softclip_desat=%.5f peak_enabled=%d peak_smoothing=%.5f peak_scene_low=%.5f peak_scene_high=%.5f peak_percentile=%.5f peak_black_cutoff=%.5f peak_delayed=%d",
+                  map->gamut_constants.perceptual_deadzone,
+                  map->gamut_constants.perceptual_strength,
+                  map->gamut_constants.colorimetric_gamma,
+                  map->gamut_constants.softclip_knee,
+                  map->gamut_constants.softclip_desat, !!peak,
+                  peak ? peak->smoothing_period : 0.0,
+                  peak ? peak->scene_threshold_low : 0.0,
+                  peak ? peak->scene_threshold_high : 0.0,
+                  peak ? peak->percentile : 0.0,
+                  peak ? peak->black_cutoff : 0.0,
+                  peak && peak->allow_delayed);
+        const struct pl_dither_params *dither = params.dither_params;
+        p5_vo_log("P5_POLICY", "render dither_enabled=%d dither_method=%d dither_lut=%d dither_temporal=%d dither_transfer=%d error_diffusion=%d target_bits_color=%d target_bits_sample=%d",
+                  !!dither, dither ? dither->method : -1,
+                  dither ? dither->lut_size : 0,
+                  dither && dither->temporal,
+                  dither ? dither->transfer : -1,
+                  !!params.error_diffusion,
+                  target.repr.bits.color_depth,
+                  target.repr.bits.sample_depth);
+    }
+#endif
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+    const struct pl_hook **p5_l2c_hooks = NULL;
+    if (p->p5_l2c_rgb_dump && !p->p5_l2c_rgb_dump_done &&
+        frame->current && frame->current->params.dv_profile == 5 &&
+        frame->current->pts >= 10.0 && frame->current->pts < 10.2) {
+        p5_l2c_hooks = talloc_array(NULL, const struct pl_hook *,
+                                    params.num_hooks + 1);
+        if (p5_l2c_hooks) {
+            if (params.num_hooks)
+                memcpy(p5_l2c_hooks, params.hooks,
+                       params.num_hooks * sizeof(*p5_l2c_hooks));
+            p5_l2c_hooks[params.num_hooks++] = &p->p5_l2c_rgb_hook;
+            params.hooks = p5_l2c_hooks;
+            p->p5_l2c_dump_pts = frame->current->pts;
+        }
+    }
+#endif
+#ifdef __ANDROID__
+    int64_t p5_section_wall_start = p->p5_section_perf ? mp_time_ns() : 0;
+    int64_t p5_section_cpu_start = p->p5_section_perf ? p5_thread_cpu_ns() : 0;
+#endif
+#ifdef __ANDROID__
+    // Diagnostic isolation only: keep decode, queue/map, EGL output and frame
+    // lifetime, but omit external-texture sampling and Dolby rendering.
+    char p5_clear_property[PROP_VALUE_MAX] = {0};
+    bool p5_clear_only = frame->current &&
+        frame->current->params.dv_profile == 5 &&
+        __system_property_get("debug.media_kit.p5_perf_clear_only",
+                              p5_clear_property) > 0 &&
+        !strcmp(p5_clear_property, "1");
+    if (p5_clear_only) {
+        char p5_map_property[PROP_VALUE_MAX] = {0};
+        bool p5_map_only =
+            __system_property_get("debug.media_kit.p5_perf_map_only",
+                                  p5_map_property) > 0 &&
+            !strcmp(p5_map_property, "1");
+        static bool p5_clear_logged;
+        if (!p5_clear_logged) {
+            p5_clear_logged = true;
+            p5_vo_log("P5_PERF_CLEAR_ONLY", "enabled=1 map_only=%d queue_frames=%d",
+                      p5_map_only, mix.num_frames);
+        }
+        struct pl_frame *p5_mapped = NULL;
+        if (p5_map_only) {
+            if (mix.num_frames != 1 || !mix.frames[0]->acquire) {
+                p5_vo_log("P5_PERF_MAP_ONLY", "unsupported queue_frames=%d",
+                          mix.num_frames);
+                p5_render_ok = false;
+            } else {
+                p5_mapped = (struct pl_frame *) mix.frames[0];
+                p5_render_ok = p5_mapped->acquire(gpu, p5_mapped);
+            }
+        } else {
+            p5_render_ok = true;
+        }
+        pl_tex_clear(gpu, swframe.fbo, (float[4]){0.25, 0.25, 0.25, 1.0});
+        if (p5_mapped && p5_render_ok)
+            p5_mapped->release(gpu, p5_mapped);
+    } else {
+        char p5_two_pass_property[PROP_VALUE_MAX] = {0};
+        bool p5_two_pass = frame->current &&
+            frame->current->params.dv_profile == 5 && mix.num_frames == 1 &&
+            __system_property_get("debug.media_kit.p5_perf_two_pass",
+                                  p5_two_pass_property) > 0 &&
+            !strcmp(p5_two_pass_property, "1");
+        char p5_color_stage_property[PROP_VALUE_MAX] = {0};
+        int p5_color_stage = 0;
+        if (frame->current && frame->current->params.dv_profile == 5 &&
+            mix.num_frames == 1 &&
+            __system_property_get("debug.media_kit.p5_perf_color_stage",
+                                  p5_color_stage_property) > 0) {
+            if (!strcmp(p5_color_stage_property, "1"))
+                p5_color_stage = 1; // YUV/PQ to SDR without DV metadata
+            else if (!strcmp(p5_color_stage_property, "2"))
+                p5_color_stage = 2; // DV reconstruction to PQ target
+        }
+        char p5_sample_property[PROP_VALUE_MAX] = {0};
+        bool p5_sample_only = frame->current &&
+            frame->current->params.dv_profile == 5 && mix.num_frames == 1 &&
+            __system_property_get("debug.media_kit.p5_perf_sample_only",
+                                  p5_sample_property) > 0 &&
+            !strcmp(p5_sample_property, "1");
+        if (p5_two_pass) {
+            int w = swframe.fbo->params.w, h = swframe.fbo->params.h;
+            if (p->p5_two_pass_tex &&
+                (p->p5_two_pass_tex->params.w != w ||
+                 p->p5_two_pass_tex->params.h != h))
+                pl_tex_destroy(gpu, &p->p5_two_pass_tex);
+            if (!p->p5_two_pass_tex) {
+                pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 16, 16,
+                                        PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE);
+                if (fmt)
+                    p->p5_two_pass_tex = pl_tex_create(gpu, pl_tex_params(
+                        .w = w, .h = h, .format = fmt,
+                        .renderable = true, .sampleable = true));
+                p5_vo_log("P5_PERF_TWO_PASS", "create w=%d h=%d fmt=%s ok=%d",
+                          w, h, fmt ? fmt->name : "none", !!p->p5_two_pass_tex);
+            }
+            p5_render_ok = false;
+            if (p->p5_two_pass_tex) {
+                struct pl_frame p5_pq_target = target;
+                p5_pq_target.planes[0].texture = p->p5_two_pass_tex;
+                p5_pq_target.repr.bits = (struct pl_bit_encoding) {0};
+                p5_pq_target.color = mix.frames[0]->color;
+                p5_pq_target.icc = NULL;
+                p5_pq_target.profile = (struct pl_icc_profile) {0};
+                p5_pq_target.lut = NULL;
+                p5_pq_target.num_overlays = 0;
+                struct pl_render_params p5_first_params = params;
+                p5_first_params.dither_params = NULL;
+                p5_first_params.peak_detect_params = NULL;
+                bool first_ok = pl_render_image_mix(p->rr, &mix, &p5_pq_target,
+                                                    &p5_first_params);
+                if (first_ok) {
+                    struct pl_frame p5_pq_source = p5_pq_target;
+                    p5_pq_source.repr.sys = PL_COLOR_SYSTEM_RGB;
+                    p5_pq_source.repr.levels = PL_COLOR_LEVELS_FULL;
+                    p5_pq_source.repr.bits = (struct pl_bit_encoding) {0};
+                    p5_pq_source.num_overlays = 0;
+                    struct pl_render_params p5_second_params = params;
+                    p5_second_params.hooks = NULL;
+                    p5_second_params.num_hooks = 0;
+                    p5_second_params.deband_params = NULL;
+                    p5_second_params.sigmoid_params = NULL;
+                    p5_render_ok = pl_render_image(p->rr, &p5_pq_source,
+                                                   &target, &p5_second_params);
+                }
+                static bool p5_two_pass_logged;
+                if (!p5_two_pass_logged) {
+                    p5_two_pass_logged = true;
+                    p5_vo_log("P5_PERF_TWO_PASS", "first_ok=%d render_ok=%d source_trc=%d pq_target_trc=%d final_target_trc=%d",
+                              first_ok, p5_render_ok, mix.frames[0]->color.transfer,
+                              p5_pq_target.color.transfer, target.color.transfer);
+                }
+            }
+        } else if (p5_color_stage) {
+            struct pl_frame p5_stage_frame = *mix.frames[0];
+            struct pl_frame p5_stage_target = target;
+            const struct pl_frame *p5_stage_frames[1] = { &p5_stage_frame };
+            struct pl_frame_mix p5_stage_mix = mix;
+            p5_stage_mix.frames = p5_stage_frames;
+            if (p5_color_stage == 1) {
+                p5_stage_frame.repr.sys = PL_COLOR_SYSTEM_BT_2020_NC;
+                p5_stage_frame.repr.dovi = NULL;
+            } else {
+                p5_stage_target.color = p5_stage_frame.color;
+            }
+            static int p5_color_stage_logged;
+            if (p5_color_stage_logged != p5_color_stage) {
+                p5_color_stage_logged = p5_color_stage;
+                p5_vo_log("P5_PERF_COLOR_STAGE", "mode=%d source_sys=%d source_trc=%d target_trc=%d width=%d height=%d",
+                          p5_color_stage, p5_stage_frame.repr.sys,
+                          p5_stage_frame.color.transfer,
+                          p5_stage_target.color.transfer,
+                          swframe.fbo->params.w, swframe.fbo->params.h);
+            }
+            p5_render_ok = pl_render_image_mix(p->rr, &p5_stage_mix,
+                                                &p5_stage_target, &params);
+        } else if (p5_sample_only) {
+            char p5_fullparams_property[PROP_VALUE_MAX] = {0};
+            bool p5_fullparams =
+                __system_property_get("debug.media_kit.p5_perf_fullparams",
+                                      p5_fullparams_property) > 0 &&
+                !strcmp(p5_fullparams_property, "1");
+            // Diagnostic only: preserve the external texture acquire/sample,
+            // scaling, target write and release, while bypassing DV and HDR
+            // color processing. YUV channels are intentionally treated as RGB.
+            struct pl_frame p5_sample_frame = *mix.frames[0];
+            p5_sample_frame.repr.sys = PL_COLOR_SYSTEM_RGB;
+            p5_sample_frame.repr.levels = PL_COLOR_LEVELS_FULL;
+            p5_sample_frame.repr.bits = (struct pl_bit_encoding) {0};
+            p5_sample_frame.repr.dovi = NULL;
+            p5_sample_frame.color = target.color;
+            p5_sample_frame.icc = NULL;
+            p5_sample_frame.profile = (struct pl_icc_profile) {0};
+            p5_sample_frame.lut = NULL;
+            const struct pl_frame *p5_sample_frames[1] = { &p5_sample_frame };
+            struct pl_frame_mix p5_sample_mix = mix;
+            p5_sample_mix.frames = p5_sample_frames;
+            struct pl_render_params p5_sample_params = params;
+            if (!p5_fullparams) {
+                p5_sample_params.upscaler = NULL;
+                p5_sample_params.downscaler = NULL;
+                p5_sample_params.frame_mixer = NULL;
+                p5_sample_params.deband_params = NULL;
+                p5_sample_params.sigmoid_params = NULL;
+                p5_sample_params.peak_detect_params = NULL;
+                p5_sample_params.dither_params = NULL;
+                p5_sample_params.hooks = NULL;
+                p5_sample_params.num_hooks = 0;
+                p5_sample_params.skip_caching_single_frame = true;
+            }
+            static bool p5_sample_logged;
+            if (!p5_sample_logged) {
+                p5_sample_logged = true;
+                p5_vo_log("P5_PERF_SAMPLE_ONLY", "enabled=1 fullparams=%d width=%d height=%d",
+                          p5_fullparams, swframe.fbo->params.w, swframe.fbo->params.h);
+            }
+            p5_render_ok = pl_render_image_mix(p->rr, &p5_sample_mix,
+                                                &target, &p5_sample_params);
+        } else if (frame->current && frame->current->params.dv_profile == 5 &&
+                   frame->current->params.repr.dovi && mix.num_frames == 1 &&
+                   target.color.transfer == PL_COLOR_TRC_BT_1886 &&
+                   params.color_map_params) {
+            // Diagnostic only: keep the real DV source and SDR target while
+            // varying one display-mapping cost at a time.
+            char variant_property[PROP_VALUE_MAX] = {0};
+            __system_property_get("debug.media_kit.p5_perf_map_variant",
+                                  variant_property);
+            int variant = !strcmp(variant_property, "1") ? 1 :
+                          !strcmp(variant_property, "2") ? 2 :
+                          !strcmp(variant_property, "3") ? 3 : 0;
+            if (!variant) {
+                p5_render_ok = pl_render_image_mix(p->rr, &mix, &target, &params);
+            } else {
+                struct pl_render_params variant_params = params;
+                struct pl_color_map_params variant_map = *params.color_map_params;
+                if (variant == 1 || variant == 3)
+                    variant_params.peak_detect_params = NULL;
+                if (variant == 2 || variant == 3) {
+                    variant_map.tone_mapping_function = &pl_tone_map_clip;
+                    variant_params.color_map_params = &variant_map;
+                }
+                static int logged_variant = -1;
+                if (logged_variant != variant) {
+                    logged_variant = variant;
+                    p5_vo_log("P5_PERF_MAP_VARIANT",
+                              "mode=%d peak_before=%d clip_before=%d source_sys=%d target_trc=%d width=%d height=%d",
+                              variant, !!params.peak_detect_params,
+                              params.color_map_params->tone_mapping_function == &pl_tone_map_clip,
+                              mix.frames[0]->repr.sys, target.color.transfer,
+                              swframe.fbo->params.w, swframe.fbo->params.h);
+                }
+                p5_render_ok = pl_render_image_mix(p->rr, &mix, &target,
+                                                    &variant_params);
+            }
+        } else {
+            p5_render_ok = pl_render_image_mix(p->rr, &mix, &target, &params);
+        }
+    }
+#else
+    p5_render_ok = pl_render_image_mix(p->rr, &mix, &target, &params);
+#endif
+#ifdef __ANDROID__
+    if (p->p5_section_perf) {
+        p->p5_render_wall_sum_ns += mp_time_ns() - p5_section_wall_start;
+        p->p5_render_cpu_sum_ns += p5_thread_cpu_ns() - p5_section_cpu_start;
+        if (++p->p5_section_frames % 250 == 0) {
+            p5_vo_log("P5_SECTION_RENDER", "frames=250 wall_us=%"PRId64" cpu_us=%"PRId64,
+                      p->p5_render_wall_sum_ns / 1000,
+                      p->p5_render_cpu_sum_ns / 1000);
+            p->p5_render_wall_sum_ns = p->p5_render_cpu_sum_ns = 0;
+        }
+    }
+#endif
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+    talloc_free(p5_l2c_hooks);
+#endif
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+    static bool p5_gamut_target_logged;
+    if (!p5_gamut_target_logged && frame->current && frame->current->pts >= 10.0) {
+        p5_gamut_target_logged = true;
+        const struct pl_frame *p5_source = mix.num_frames ? mix.frames[0] : NULL;
+        p5_vo_log("P5_GAMUT_TARGET", "pts=%.9f rendered=%d source_count=%d source_prim=%d source_trc=%d source_lut=%d source_lut_type=%d param_lut=%d param_lut_type=%d color_map=%d target_sys=%d target_prim=%d target_trc=%d",
+                  frame->current->pts, p5_render_ok, mix.num_frames,
+                  p5_source ? p5_source->color.primaries : -1,
+                  p5_source ? p5_source->color.transfer : -1,
+                  p5_source && p5_source->lut != NULL,
+                  p5_source ? p5_source->lut_type : -1,
+                  params.lut != NULL, params.lut_type,
+                  params.color_map_params != NULL,
+                  target.repr.sys, target.color.primaries, target.color.transfer);
+    }
+#endif
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+    if (!p->p5_gpu_timer_full)
+        p5_gpu_timer_end(p, p5_gpu_slot, p5_render_ok);
+#endif
+    if (!p5_render_ok) {
         MP_ERR(vo, "Failed rendering frame!\n");
         goto done;
     }
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+    if (p->p5_post_rpu_probe && !p->p5_post_rpu_probe_done &&
+        frame->current && frame->current->pts >= 10.0) {
+        p->p5_post_rpu_probe_done = true;
+        p5_vo_log("P5_POST_RPU", "pts=%.9f size=%dx%d fmt=%s host_readable=%d target_repr=%d target_primaries=%d target_transfer=%d target_min_luma=%.6f target_max_luma=%.6f target_icc=%d target_lut=%d",
+                  frame->current->pts, swframe.fbo->params.w,
+                  swframe.fbo->params.h,
+                  swframe.fbo->params.format ? swframe.fbo->params.format->name : "null",
+                  swframe.fbo->params.host_readable, target.repr.sys,
+                  target.color.primaries, target.color.transfer,
+                  target.color.hdr.min_luma, target.color.hdr.max_luma,
+                  !!target.icc, !!target.lut);
+        GL *probe_gl = ra_gl_get(p->ra_ctx->ra);
+        GLint read_fbo = -1, draw_fbo = -1;
+        probe_gl->GetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fbo);
+        probe_gl->GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo);
+        p5_vo_log("P5_POST_RPU", "pts=%.9f read_fbo=%d draw_fbo=%d",
+                  frame->current->pts, read_fbo, draw_fbo);
+        for (int iy = 1; iy <= 3; iy++) {
+            int y = iy * swframe.fbo->params.h / 4;
+            for (int ix = 1; ix <= 3; ix++) {
+                int x = ix * swframe.fbo->params.w / 4;
+                uint8_t rgba[8] = {0};
+                bool download_ok = true;
+                if (p->p5_offscreen_native) {
+                    download_ok = pl_tex_download(gpu, pl_tex_transfer_params(
+                        .tex = p->p5_offscreen_tex,
+                        .rc = {x, y, 0, x + 1, y + 1, 1},
+                        .ptr = rgba,
+                    ));
+                } else {
+                    probe_gl->ReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE,
+                                         rgba);
+                }
+                GLenum error = probe_gl->GetError();
+                if (p->p5_offscreen_float) {
+                    uint16_t half[4];
+                    memcpy(half, rgba, sizeof(half));
+                    p5_vo_log("P5_POST_RPU", "pts=%.9f xy=%d,%d download_ok=%d gl_error=0x%x rgba16f=%04x,%04x,%04x,%04x",
+                              frame->current->pts, x, y, download_ok, error,
+                              half[0], half[1], half[2], half[3]);
+                } else {
+                    p5_vo_log("P5_POST_RPU", "pts=%.9f xy=%d,%d download_ok=%d gl_error=0x%x rgba=%u,%u,%u,%u",
+                              frame->current->pts, x, y, download_ok, error,
+                              rgba[0], rgba[1], rgba[2], rgba[3]);
+                }
+            }
+        }
+        if (p->p5_post_rpu_full_dump && p->p5_offscreen_native) {
+            int w = swframe.fbo->params.w, h = swframe.fbo->params.h;
+            size_t bytes = (size_t) w * h * (p->p5_offscreen_float ? 8 : 4);
+            uint8_t *pixels = malloc(bytes);
+            bool download_ok = pixels && pl_tex_download(gpu, pl_tex_transfer_params(
+                .tex = p->p5_offscreen_tex,
+                .rc = {0, 0, 0, w, h, 1},
+                .ptr = pixels,
+            ));
+            size_t written = 0;
+            if (download_ok) {
+                const char *path = p->p5_offscreen_float
+                    ? "/sdcard/Android/data/com.example.media_kit_test/files/p5-post-rpu-full.rgba16f"
+                    : "/sdcard/Android/data/com.example.media_kit_test/files/p5-post-rpu-full.rgba";
+                FILE *file = fopen(path, "wb");
+                if (file) {
+                    written = fwrite(pixels, 1, bytes, file);
+                    fclose(file);
+                }
+            }
+            p5_vo_log("P5_POST_RPU_FULL", "pts=%.9f w=%d h=%d format=%s bytes=%zu download_ok=%d written=%zu",
+                      frame->current->pts, w, h, p->p5_offscreen_float ? "rgba16f" : "rgba8",
+                      bytes, download_ok, written);
+            free(pixels);
+        }
+    }
+#endif
+    if (p->p5_vo_perf)
+        p5_render_end_ns = mp_time_ns();
 
     struct pl_frame ref_frame;
     pl_frames_infer_mix(p->rr, &mix, &target, &ref_frame);
@@ -1434,15 +2360,78 @@ done:
     if (!valid) // clear with purple to indicate error
         pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.5, 0.0, 1.0, 1.0 });
 
+    int64_t p5_flush_start_ns = p->p5_vo_perf ? mp_time_ns() : 0;
     pl_gpu_flush(gpu);
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+    if (p->p5_gpu_timer_full)
+        p5_gpu_timer_end(p, p5_gpu_slot, p5_render_ok);
+    if (p->p5_offscreen && p->p5_offscreen_ready) {
+        int64_t finish_start_ns = mp_time_ns();
+        pl_gpu_finish(gpu);
+        p->p5_offscreen_frames++;
+        if (p->p5_offscreen_frames <= 20 || p->p5_offscreen_frames % 50 == 0)
+            p5_vo_log("P5_OFFSCREEN", "frame=%"PRIu64" valid=%d finish_us=%"PRId64,
+                      p->p5_offscreen_frames, valid,
+                      (mp_time_ns() - finish_start_ns) / 1000);
+        if (p->p5_offscreen_check && p->p5_offscreen_frames % 50 == 0) {
+            uint8_t pixel[8] = {0};
+            int x = swframe.fbo->params.w / 2, y = swframe.fbo->params.h / 2;
+            bool read_ok = pl_tex_download(gpu, pl_tex_transfer_params(
+                .tex = p->p5_offscreen_tex,
+                .rc = {x, y, 0, x + 1, y + 1, 1},
+                .ptr = pixel,
+            ));
+            if (p->p5_offscreen_float) {
+                uint16_t half[4];
+                memcpy(half, pixel, sizeof(half));
+                p5_vo_log("P5_OFFSCREEN_PIXEL", "frame=%"PRIu64" ok=%d x=%d y=%d rgba16f=%04x,%04x,%04x,%04x",
+                          p->p5_offscreen_frames, read_ok, x, y,
+                          half[0], half[1], half[2], half[3]);
+            } else {
+                p5_vo_log("P5_OFFSCREEN_PIXEL", "frame=%"PRIu64" ok=%d x=%d y=%d rgba=%02x%02x%02x%02x",
+                          p->p5_offscreen_frames, read_ok, x, y,
+                          pixel[0], pixel[1], pixel[2], pixel[3]);
+            }
+        }
+        p->frame_pending = false;
+        return VO_TRUE;
+    }
+#endif
+    if (p->p5_vo_perf &&
+        (p->p5_vo_perf_seq <= 20 || p->p5_vo_perf_seq % 50 == 0)) {
+        p5_vo_log("P5_VO_TIME", "frame=%"PRIu64" prep_us=%"PRId64" render_us=%"PRId64" after_render_us=%"PRId64" flush_us=%"PRId64,
+                p->p5_vo_perf_seq,
+                p5_render_start_ns ? (p5_render_start_ns - p5_draw_start_ns) / 1000 : -1,
+                p5_render_end_ns ? (p5_render_end_ns - p5_render_start_ns) / 1000 : -1,
+                p5_render_end_ns ? (p5_flush_start_ns - p5_render_end_ns) / 1000 : -1,
+                (mp_time_ns() - p5_flush_start_ns) / 1000);
+    }
     p->frame_pending = true;
+#ifdef __ANDROID__
+    if (p->p5_vo_cpu_wall && p5_cpu_start_ns) {
+        int64_t wall_ns = mp_time_ns() - p5_wall_start_ns;
+        int64_t cpu_ns = p5_thread_cpu_ns() - p5_cpu_start_ns;
+        p->p5_draw_wall_sum_ns += wall_ns;
+        p->p5_draw_cpu_sum_ns += cpu_ns;
+        p->p5_draw_wall_max_ns = MPMAX(p->p5_draw_wall_max_ns, wall_ns);
+    }
+#endif
     return VO_TRUE;
 }
 
 static void flip_page(struct vo *vo)
 {
     struct priv *p = vo->priv;
+#ifdef __ANDROID__
+    int64_t p5_wall_start_ns = p->p5_vo_cpu_wall ? mp_time_ns() : 0;
+    int64_t p5_cpu_start_ns = p->p5_vo_cpu_wall ? p5_thread_cpu_ns() : 0;
+#endif
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+    if (p->p5_offscreen && p->p5_offscreen_ready)
+        return;
+#endif
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
+    int64_t p5_flip_start_ns = p->p5_vo_perf ? mp_time_ns() : 0;
 
     if (p->frame_pending) {
         if (!pl_swapchain_submit_frame(p->sw))
@@ -1450,7 +2439,44 @@ static void flip_page(struct vo *vo)
         p->frame_pending = false;
     }
 
+    int64_t p5_submit_end_ns = p->p5_vo_perf ? mp_time_ns() : 0;
+#ifdef __ANDROID__
+    int64_t p5_mid_wall_ns = p->p5_vo_cpu_wall ? mp_time_ns() : 0;
+    int64_t p5_mid_cpu_ns = p->p5_vo_cpu_wall ? p5_thread_cpu_ns() : 0;
+#endif
     sw->fns->swap_buffers(sw);
+#ifdef __ANDROID__
+    if (p->p5_vo_cpu_wall && p5_cpu_start_ns) {
+        int64_t end_wall_ns = mp_time_ns(), end_cpu_ns = p5_thread_cpu_ns();
+        int64_t wall_ns = end_wall_ns - p5_wall_start_ns;
+        int64_t cpu_ns = end_cpu_ns - p5_cpu_start_ns;
+        p->p5_flip_wall_sum_ns += wall_ns;
+        p->p5_flip_cpu_sum_ns += cpu_ns;
+        p->p5_submit_wall_sum_ns += p5_mid_wall_ns - p5_wall_start_ns;
+        p->p5_submit_cpu_sum_ns += p5_mid_cpu_ns - p5_cpu_start_ns;
+        p->p5_swap_wall_sum_ns += end_wall_ns - p5_mid_wall_ns;
+        p->p5_swap_cpu_sum_ns += end_cpu_ns - p5_mid_cpu_ns;
+        p->p5_flip_wall_max_ns = MPMAX(p->p5_flip_wall_max_ns, wall_ns);
+        if (++p->p5_vo_cpu_wall_frames % 250 == 0) {
+            p5_vo_log("P5_VO_CPU_WALL", "frames=250 draw_wall_us=%"PRId64" draw_cpu_us=%"PRId64" draw_wall_max_us=%"PRId64" flip_wall_us=%"PRId64" flip_cpu_us=%"PRId64" flip_wall_max_us=%"PRId64" submit_wall_us=%"PRId64" submit_cpu_us=%"PRId64" swap_wall_us=%"PRId64" swap_cpu_us=%"PRId64,
+                      p->p5_draw_wall_sum_ns / 1000, p->p5_draw_cpu_sum_ns / 1000,
+                      p->p5_draw_wall_max_ns / 1000, p->p5_flip_wall_sum_ns / 1000,
+                      p->p5_flip_cpu_sum_ns / 1000, p->p5_flip_wall_max_ns / 1000,
+                      p->p5_submit_wall_sum_ns / 1000, p->p5_submit_cpu_sum_ns / 1000,
+                      p->p5_swap_wall_sum_ns / 1000, p->p5_swap_cpu_sum_ns / 1000);
+            p->p5_draw_wall_sum_ns = p->p5_draw_cpu_sum_ns = 0;
+            p->p5_flip_wall_sum_ns = p->p5_flip_cpu_sum_ns = 0;
+            p->p5_submit_wall_sum_ns = p->p5_submit_cpu_sum_ns = 0;
+            p->p5_swap_wall_sum_ns = p->p5_swap_cpu_sum_ns = 0;
+            p->p5_draw_wall_max_ns = p->p5_flip_wall_max_ns = 0;
+        }
+    }
+#endif
+    if (p->p5_vo_perf &&
+        (p->p5_vo_perf_seq <= 20 || p->p5_vo_perf_seq % 50 == 0))
+        p5_vo_log("P5_VO_FLIP", "frame=%"PRIu64" submit_us=%"PRId64" swap_us=%"PRId64,
+                p->p5_vo_perf_seq, (p5_submit_end_ns - p5_flip_start_ns) / 1000,
+                (mp_time_ns() - p5_submit_end_ns) / 1000);
 }
 
 static void get_vsync(struct vo *vo, struct vo_vsync_info *info)
@@ -2076,6 +3102,25 @@ done:
 static void uninit(struct vo *vo)
 {
     struct priv *p = vo->priv;
+#ifdef __ANDROID__
+    if (p->p5_pass_identity)
+        p5_vo_log("P5_PASS_ID_FINAL", "callbacks=%"PRIu64" unique=%d changes=%"PRIu64" over_limit=%"PRIu64,
+                  p->p5_pass_callbacks, p->p5_pass_signature_count,
+                  p->p5_pass_changes, p->p5_pass_overflow);
+#endif
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(__ANDROID__)
+    if (p->p5_offscreen_tex)
+        pl_tex_destroy(p->gpu, &p->p5_offscreen_tex);
+    if (p->p5_two_pass_tex)
+        pl_tex_destroy(p->gpu, &p->p5_two_pass_tex);
+    if (p->p5_gpu_timer) {
+        GL *gl = p5_gpu_timer_gl(p);
+        for (int n = 0; n < MP_ARRAY_SIZE(p->p5_gpu_query); n++) {
+            gl->DeleteQueries(1, &p->p5_gpu_query[n].start);
+            gl->DeleteQueries(1, &p->p5_gpu_query[n].end);
+        }
+    }
+#endif
     pl_queue_destroy(&p->queue); // destroy this first
     for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state.entries); i++)
         pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tex);
@@ -2126,12 +3171,90 @@ static void load_hwdec_api(void *ctx, struct hwdec_imgfmt_request *params)
 static int preinit(struct vo *vo)
 {
     struct priv *p = vo->priv;
+#ifdef __ANDROID__
+    char p5_section_property[PROP_VALUE_MAX] = {0};
+    p->p5_section_perf = __system_property_get("debug.media_kit.p5_section_perf",
+                                              p5_section_property) > 0 &&
+                         !strcmp(p5_section_property, "1");
+    char p5_cpu_wall_property[PROP_VALUE_MAX] = {0};
+    p->p5_vo_cpu_wall = __system_property_get("debug.media_kit.p5_vo_cpu_wall",
+                                              p5_cpu_wall_property) > 0 &&
+                         !strcmp(p5_cpu_wall_property, "1");
+    char p5_perf_property[PROP_VALUE_MAX] = {0};
+    p->p5_vo_perf = __system_property_get("debug.media_kit.p5_vo_perf",
+                                         p5_perf_property) > 0 &&
+                    !strcmp(p5_perf_property, "1");
+    char p5_pass_identity_property[PROP_VALUE_MAX] = {0};
+    p->p5_pass_identity = __system_property_get(
+        "debug.media_kit.p5_pass_identity", p5_pass_identity_property) > 0 &&
+        !strcmp(p5_pass_identity_property, "1");
+#if HAVE_GL && defined(PL_HAVE_OPENGL)
+    char p5_post_rpu_property[PROP_VALUE_MAX] = {0};
+    char p5_post_rpu_full_property[PROP_VALUE_MAX] = {0};
+    p->p5_post_rpu_probe = __system_property_get(
+        "debug.media_kit.p5_post_rpu_probe", p5_post_rpu_property) > 0 &&
+        !strcmp(p5_post_rpu_property, "1");
+    p->p5_post_rpu_full_dump = p->p5_post_rpu_probe &&
+        __system_property_get("debug.media_kit.p5_post_rpu_full_dump",
+                              p5_post_rpu_full_property) > 0 &&
+        !strcmp(p5_post_rpu_full_property, "1");
+    char p5_l2c_property[PROP_VALUE_MAX] = {0};
+    p->p5_l2c_rgb_dump = __system_property_get(
+        "debug.media_kit.p5_l2c_rgb_dump", p5_l2c_property) > 0 &&
+        !strcmp(p5_l2c_property, "1");
+    p->p5_l2c_rgb_hook = (struct pl_hook) {
+        .stages = PL_HOOK_RGB,
+        .input = PL_HOOK_SIG_TEX,
+        .priv = p,
+        .hook = p5_l2c_rgb_hook,
+        .signature = 0x50354c3243524742ULL,
+    };
+    char p5_offscreen_property[PROP_VALUE_MAX] = {0};
+    char p5_check_property[PROP_VALUE_MAX] = {0};
+    char p5_half_property[PROP_VALUE_MAX] = {0};
+    char p5_native_property[PROP_VALUE_MAX] = {0};
+    char p5_target_203_property[PROP_VALUE_MAX] = {0};
+    p->p5_offscreen = __system_property_get("debug.media_kit.p5_offscreen",
+                                            p5_offscreen_property) > 0 &&
+                       !strcmp(p5_offscreen_property, "1");
+    p->p5_offscreen_check = p->p5_offscreen &&
+        __system_property_get("debug.media_kit.p5_offscreen_check",
+                              p5_check_property) > 0 &&
+        !strcmp(p5_check_property, "1");
+    p->p5_offscreen_half = p->p5_offscreen &&
+        __system_property_get("debug.media_kit.p5_offscreen_half",
+                              p5_half_property) > 0 &&
+        !strcmp(p5_half_property, "1");
+    p->p5_offscreen_native = p->p5_offscreen &&
+        __system_property_get("debug.media_kit.p5_offscreen_native",
+                              p5_native_property) > 0 &&
+        !strcmp(p5_native_property, "1");
+    char p5_float_property[PROP_VALUE_MAX] = {0};
+    p->p5_offscreen_float = p->p5_offscreen_native &&
+        __system_property_get("debug.media_kit.p5_offscreen_float",
+                              p5_float_property) > 0 &&
+        !strcmp(p5_float_property, "1");
+    p->p5_target_203 = p->p5_offscreen_native &&
+        __system_property_get("debug.media_kit.p5_target_203",
+                              p5_target_203_property) > 0 &&
+        !strcmp(p5_target_203_property, "1");
+    char p5_target_pq_property[PROP_VALUE_MAX] = {0};
+    p->p5_target_pq = p->p5_offscreen_float &&
+        __system_property_get("debug.media_kit.p5_target_pq",
+                              p5_target_pq_property) > 0 &&
+        !strcmp(p5_target_pq_property, "1");
+#endif
+#endif
     p->opts_cache = m_config_cache_alloc(p, vo->global, &gl_video_conf);
     p->next_opts_cache = m_config_cache_alloc(p, vo->global, &gl_next_conf);
     p->next_opts = p->next_opts_cache->opts;
     p->video_eq = mp_csp_equalizer_create(p, vo->global);
     p->global = vo->global;
     p->log = vo->log;
+#ifdef __ANDROID__
+    p5_vo_log("P5_VO_INIT", "enabled=%d property=%s", p->p5_vo_perf,
+              p5_perf_property);
+#endif
 
     struct gl_video_opts *gl_opts = p->opts_cache->opts;
     struct ra_ctx_opts *ctx_opts = mp_get_config_group(vo, vo->global, &ra_ctx_conf);
