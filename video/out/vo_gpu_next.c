@@ -1889,6 +1889,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         p5_sdr_color_map = *params.color_map_params;
         p5_sdr_color_map.gamut_mapping = &pl_gamut_map_clip;
         params.color_map_params = &p5_sdr_color_map;
+        params.optimize_dovi_linear_decode = true;
     }
     if (!p->p5_policy_logged && frame->current &&
         frame->current->params.dv_profile == 5 && mix.num_frames == 1 &&
