@@ -54,10 +54,34 @@
 // Needed because the av_log callback does not provide a library-safe message
 // callback.
 static mp_static_mutex log_lock = MP_STATIC_MUTEX_INITIALIZER;
+struct av_log_owner {
+    struct mpv_global *global;
+    struct mp_log *root, *decaudio, *decvideo, *demuxer;
+    struct av_log_owner *next;
+};
+static struct av_log_owner *log_owners;
 static struct mpv_global *log_mpv_instance;
 static struct mp_log *log_root, *log_decaudio, *log_decvideo, *log_demuxer;
 static bool log_print_prefix = true;
 static bstr log_buffer;
+
+// FFmpeg has one process-wide log callback and cannot identify the owning mpv
+// instance. Preserve the original first-instance routing while it lives, then
+// hand the process-wide sink to the next oldest live instance.
+static void select_log_owner(void)
+{
+    struct av_log_owner *owner = log_owners;
+    if (log_mpv_instance == (owner ? owner->global : NULL))
+        return;
+    talloc_free(log_buffer.start);
+    log_mpv_instance = owner ? owner->global : NULL;
+    log_root = owner ? owner->root : NULL;
+    log_decaudio = owner ? owner->decaudio : NULL;
+    log_decvideo = owner ? owner->decvideo : NULL;
+    log_demuxer = owner ? owner->demuxer : NULL;
+    log_print_prefix = true;
+    log_buffer = (bstr){0};
+}
 
 static int av_log_level_to_mp_level(int av_level)
 {
@@ -153,15 +177,20 @@ done:
 void init_libav(struct mpv_global *global)
 {
     mp_mutex_lock(&log_lock);
-    if (!log_mpv_instance) {
-        log_mpv_instance = global;
-        log_root = mp_log_new(NULL, global->log, "ffmpeg");
-        log_decaudio = mp_log_new(log_root, log_root, "audio");
-        log_decvideo = mp_log_new(log_root, log_root, "video");
-        log_demuxer = mp_log_new(log_root, log_root, "demuxer");
-        log_buffer = (bstr){0};
+    struct av_log_owner *owner = talloc_zero(NULL, struct av_log_owner);
+    owner->global = global;
+    owner->root = mp_log_new(NULL, global->log, "ffmpeg");
+    owner->decaudio = mp_log_new(owner->root, owner->root, "audio");
+    owner->decvideo = mp_log_new(owner->root, owner->root, "video");
+    owner->demuxer = mp_log_new(owner->root, owner->root, "demuxer");
+    bool first = !log_owners;
+    struct av_log_owner **link = &log_owners;
+    while (*link)
+        link = &(*link)->next;
+    *link = owner;
+    select_log_owner();
+    if (first)
         av_log_set_callback(mp_msg_av_log_callback);
-    }
     mp_mutex_unlock(&log_lock);
 
     avformat_network_init();
@@ -174,10 +203,19 @@ void init_libav(struct mpv_global *global)
 void uninit_libav(struct mpv_global *global)
 {
     mp_mutex_lock(&log_lock);
-    if (log_mpv_instance == global) {
-        av_log_set_callback(av_log_default_callback);
-        log_mpv_instance = NULL;
-        talloc_free(log_root);
+    struct av_log_owner **link = &log_owners;
+    while (*link && (*link)->global != global)
+        link = &(*link)->next;
+    if (*link) {
+        struct av_log_owner *owner = *link;
+        *link = owner->next;
+        if (log_mpv_instance == global) {
+            select_log_owner();
+            if (!log_owners)
+                av_log_set_callback(av_log_default_callback);
+        }
+        talloc_free(owner->root);
+        talloc_free(owner);
     }
     mp_mutex_unlock(&log_lock);
 }
