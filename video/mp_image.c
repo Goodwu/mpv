@@ -868,6 +868,7 @@ bool mp_image_params_equal(const struct mp_image_params *p1,
            p1->w == p2->w && p1->h == p2->h &&
            p1->p_w == p2->p_w && p1->p_h == p2->p_h &&
            p1->force_window == p2->force_window &&
+           p1->dv_profile == p2->dv_profile &&
            pl_color_space_equal(&p1->color, &p2->color) &&
            pl_color_repr_equal(&p1->repr, &p2->repr) &&
            p1->light == p2->light &&
@@ -1133,6 +1134,7 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
     if (src->opaque_ref) {
         struct mp_image_params *p = (void *)src->opaque_ref->data;
         dst->params.stereo3d = p->stereo3d;
+        dst->params.dv_profile = p->dv_profile;
         // Might be incorrect if colorspace changes.
         dst->params.light = p->light;
 #if LIBAVUTIL_VERSION_INT < AV_VERSION_INT(60, 11, 100) || PL_API_VER < 356
@@ -1186,7 +1188,7 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
         const AVDOVIMetadata *metadata = (const AVDOVIMetadata *)sd->buf->data;
         const AVDOVIRpuDataHeader *header = av_dovi_get_header(metadata);
         if (header->disable_residual_flag) {
-            dst->dovi = dovi = av_buffer_alloc(sizeof(struct pl_dovi_metadata));
+            dst->dovi = dovi = av_buffer_allocz(sizeof(struct pl_dovi_metadata));
             MP_HANDLE_OOM(dovi);
 #if PL_API_VER >= 343
             pl_map_avdovi_metadata(&dst->params.color, &dst->params.repr,

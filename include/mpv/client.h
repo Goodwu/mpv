@@ -1731,6 +1731,15 @@ MPV_EXPORT mpv_event *mpv_wait_event(mpv_handle *ctx, double timeout);
 MPV_EXPORT void mpv_wakeup(mpv_handle *ctx);
 
 /**
+ * Calls av_jni_set_java_vm() with the given JavaVM*.
+ * https://github.com/FFmpeg/FFmpeg/blob/0ba719f726632d73592311615087a0d64aa2fb60/libavcodec/jni.h#L26-L36
+ *
+ * The av_jni_set_java_vm() symbol is not visible when statically linking with libavcodec.
+ * It is important to call this method so that libavcodec can access JNI environment & thus, mediacodec APIs.
+ */
+MPV_EXPORT int mpv_lavc_set_java_vm(void *vm);
+
+/**
  * Set a custom function that should be called when there are new events. Use
  * this if blocking in mpv_wait_event() to wait for new events is not feasible.
  *
@@ -2012,6 +2021,8 @@ MPV_DEFINE_SYM_PTR(mpv_wait_event)
 #define mpv_wait_event pfn_mpv_wait_event
 MPV_DEFINE_SYM_PTR(mpv_wakeup)
 #define mpv_wakeup pfn_mpv_wakeup
+MPV_DEFINE_SYM_PTR(mpv_lavc_set_java_vm)
+#define mpv_lavc_set_java_vm pfn_mpv_lavc_set_java_vm
 MPV_DEFINE_SYM_PTR(mpv_set_wakeup_callback)
 #define mpv_set_wakeup_callback pfn_mpv_set_wakeup_callback
 MPV_DEFINE_SYM_PTR(mpv_wait_async_requests)

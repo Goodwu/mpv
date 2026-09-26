@@ -38,6 +38,7 @@
 #include "stream/stream.h"
 #include "sub/osd.h"
 #include "video/hwdec.h"
+#include "video/img_format.h"
 #include "filters/f_decoder_wrapper.h"
 #include "video/out/vo.h"
 
@@ -425,6 +426,15 @@ static int get_req_frames(struct MPContext *mpctx, bool eof)
 
     if (mpctx->vo_chain && mpctx->vo_chain->is_sparse)
         return 1;
+
+#ifdef __ANDROID__
+    // A MediaCodec frame owns an output slot until the VO maps or drops it.
+    // Waiting for a second frame can exhaust the codec output queue before
+    // the first reaches the VO, leaving both sides waiting indefinitely.
+    if (mpctx->num_next_frames > 0 &&
+        mpctx->next_frames[0]->imgfmt == IMGFMT_MEDIACODEC)
+        return 1;
+#endif
 
     // Normally require at least 2 frames, so we can compute a frame duration.
     int min = 2;

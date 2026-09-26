@@ -22,6 +22,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#include <libavcodec/jni.h>
+
 #include "common/common.h"
 #include "common/global.h"
 #include "common/msg.h"
@@ -962,6 +964,11 @@ void mpv_wakeup(mpv_handle *ctx)
     ctx->queued_wakeup = true;
     wakeup_client(ctx);
     mp_mutex_unlock(&ctx->lock);
+}
+
+int mpv_lavc_set_java_vm(void *vm)
+{
+    return av_jni_set_java_vm(vm, NULL);
 }
 
 // map client API types to internal types

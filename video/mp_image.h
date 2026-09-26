@@ -54,6 +54,9 @@ struct mp_image_params {
     enum pl_color_primaries primaries_orig;
     enum pl_color_transfer transfer_orig;
     enum pl_color_system sys_orig;
+    // Container-declared Dolby Vision profile; zero means unavailable.
+    // Per-frame RPU presence alone does not identify the profile.
+    uint8_t dv_profile;
 
     enum mp_csp_light light;
     enum pl_chroma_location chroma_location;
