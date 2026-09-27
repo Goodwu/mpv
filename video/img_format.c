@@ -79,21 +79,6 @@ static const struct mp_imgfmt_entry mp_imgfmt_list[] = {
             .comps = { {0, 20, 10}, {0, 10, 10}, {0, 0, 10} },
         },
     },
-    [IMGFMT_YUV444_PACK10 - IMGFMT_CUST_BASE] = {
-        .name = "yuv444_pack10",
-        .desc = {
-            .flags = MP_IMGFLAG_COLOR_YUV,
-            .comps = { {0, 0, 10}, {0, 10, 10}, {0, 20, 10} },
-        },
-    },
-    [IMGFMT_YUV420_PACK10 - IMGFMT_CUST_BASE] = {
-        .name = "yuv420_pack10",
-        .desc = {
-            .flags = MP_IMGFLAG_COLOR_YUV,
-            .chroma_xs = 1, .chroma_ys = 1,
-            .comps = { {0, 0, 10}, {1, 10, 10}, {1, 20, 10} },
-        },
-    },
     [IMGFMT_YAP8 - IMGFMT_CUST_BASE] = {
         .name = "yap8",
         .desc = {

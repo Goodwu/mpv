@@ -299,8 +299,6 @@ enum mp_imgfmt {
 
     // Accessed with bit-shifts, uint32_t units.
     IMGFMT_RGB30,               // 2pad 10r 10g 10b (MSB to LSB)
-    IMGFMT_YUV444_PACK10,       // Experimental Y/U/V in RGB10_A2 channels
-    IMGFMT_YUV420_PACK10,       // Experimental full Y plus half-size UV RGB10_A2
     IMGFMT_MEDIACODEC_YUV,      // External texture sampled as raw Y/U/V
 
     // Fringe formats for fringe RGB format repacking.
