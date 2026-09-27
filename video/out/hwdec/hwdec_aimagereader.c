@@ -66,9 +66,6 @@ struct priv_owner {
     struct priv *callback_mapper;
     unsigned callbacks_active;
     bool callback_state_initialized;
-    AHardwareBuffer *removed_buffers[32];
-    int removed_count;
-    bool removed_overflow;
 
     media_status_t (*AImageReader_newWithUsage)(
         int32_t, int32_t, int32_t, uint64_t, int32_t, AImageReader **);
@@ -76,8 +73,6 @@ struct priv_owner {
         AImageReader *, ANativeWindow **);
     media_status_t (*AImageReader_setImageListener)(
         AImageReader *, AImageReader_ImageListener *);
-    media_status_t (*AImageReader_setBufferRemovedListener)(
-        AImageReader *, AImageReader_BufferRemovedListener *);
     media_status_t (*AImageReader_acquireLatestImage)(AImageReader *, AImage **);
     void (*AImageReader_delete)(AImageReader *);
     media_status_t (*AImage_getHardwareBuffer)(const AImage *, AHardwareBuffer **);
@@ -96,14 +91,6 @@ struct retired_image {
     GLsync fence;
     GLuint texture;
     struct ra_tex *wrapped_tex;
-    bool cached_egl;
-};
-
-struct egl_cache_entry {
-    AHardwareBuffer *buffer;
-    EGLImageKHR image;
-    EGLDisplay display;
-    bool removed;
 };
 
 struct priv {
@@ -140,14 +127,6 @@ struct priv {
     bool raw_early_fence;
     bool raw_retire;
     bool direct_retire;
-    bool egl_cache_enabled;
-    bool current_egl_cached;
-    void *ahb_lib;
-    void (*AHardwareBuffer_acquire)(AHardwareBuffer *);
-    void (*AHardwareBuffer_release)(AHardwareBuffer *);
-    struct egl_cache_entry egl_cache[16];
-    uint64_t egl_cache_hits, egl_cache_misses, egl_cache_bypasses;
-    uint64_t egl_cache_evictions;
     GLsync raw_sample_fence;
     struct retired_image retired[2];
     int retired_count;
@@ -161,9 +140,6 @@ struct priv {
     bool image_timeline;
     bool ahb_identity_probe;
     uint64_t ahb_identity_samples;
-    bool same_frame_cache;
-    struct mp_image *cached_frame;
-    uint64_t same_frame_hits, same_frame_evictions;
     double timeline_failed_pts;
     int64_t timeline_failed_us;
     bool timeline_followup;
@@ -401,20 +377,6 @@ static void image_callback(void *context, AImageReader *reader)
     mp_assert(o->callbacks_active > 0);
     if (--o->callbacks_active == 0)
         mp_cond_signal(&o->callback_cond);
-    mp_mutex_unlock(&o->callback_lock);
-}
-
-static void buffer_removed_callback(void *context, AImageReader *reader,
-                                    AHardwareBuffer *buffer)
-{
-    struct priv_owner *o = context;
-    mp_mutex_lock(&o->callback_lock);
-    if (o->callback_mapper) {
-        if (o->removed_count < MP_ARRAY_SIZE(o->removed_buffers))
-            o->removed_buffers[o->removed_count++] = buffer;
-        else
-            o->removed_overflow = true;
-    }
     mp_mutex_unlock(&o->callback_lock);
 }
 
@@ -1183,35 +1145,6 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
           !strcmp(direct_retire_property, "1"))) &&
         gl->FenceSync && gl->ClientWaitSync && gl->DeleteSync && gl->Flush;
     p->raw_retire |= p->direct_retire;
-    char egl_cache_property[PROP_VALUE_MAX] = {0};
-    p->egl_cache_enabled = p->direct_retire &&
-        __system_property_get("debug.media_kit.p5_egl_cache",
-                              egl_cache_property) > 0 &&
-        !strcmp(egl_cache_property, "1");
-    if (p->egl_cache_enabled) {
-        o->AImageReader_setBufferRemovedListener = dlsym(
-            o->lib_handle, "AImageReader_setBufferRemovedListener");
-        p->ahb_lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
-        p->AHardwareBuffer_acquire = p->ahb_lib ?
-            dlsym(p->ahb_lib, "AHardwareBuffer_acquire") : NULL;
-        p->AHardwareBuffer_release = p->ahb_lib ?
-            dlsym(p->ahb_lib, "AHardwareBuffer_release") : NULL;
-        if (!o->AImageReader_setBufferRemovedListener ||
-            !p->AHardwareBuffer_acquire || !p->AHardwareBuffer_release) {
-            MP_WARN(mapper, "P5 EGLImage cache unavailable on this device\n");
-            p->egl_cache_enabled = false;
-            if (p->ahb_lib) {
-                dlclose(p->ahb_lib);
-                p->ahb_lib = NULL;
-            }
-        }
-    }
-    char same_frame_property[PROP_VALUE_MAX] = {0};
-    p->same_frame_cache = p->direct_yuv && !p->raw_retire &&
-        __system_property_get("debug.media_kit.p5_same_frame_cache",
-                              same_frame_property) > 0 &&
-        !strcmp(same_frame_property, "1");
-    p5_section_log("P5_SAME_FRAME", "enabled=%d", p->same_frame_cache);
     char timeline_property[PROP_VALUE_MAX] = {0};
     p->image_timeline = p->raw_yuv &&
         __system_property_get("debug.media_kit.p5_image_timeline",
@@ -1305,25 +1238,6 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
         MP_ERR(mapper, "AImageReader_setImageListener failed: %d\n", listener_ret);
         return -1;
     }
-    if (p->egl_cache_enabled) {
-        AImageReader_BufferRemovedListener removed_listener = {
-            .context = o,
-            .onBufferRemoved = buffer_removed_callback,
-        };
-        media_status_t removed_ret =
-            o->AImageReader_setBufferRemovedListener(o->reader,
-                                                       &removed_listener);
-        if (removed_ret != AMEDIA_OK) {
-            MP_WARN(mapper, "P5 EGLImage cache listener unavailable: %d\n",
-                    removed_ret);
-            p->egl_cache_enabled = false;
-            dlclose(p->ahb_lib);
-            p->ahb_lib = NULL;
-        }
-    }
-    p5_section_log("P5_EGL_CACHE", "enabled=%d property=%s",
-                   p->egl_cache_enabled, egl_cache_property);
-
     mapper->dst_params = mapper->src_params;
     mapper->dst_params.imgfmt = p->direct_yuv ? IMGFMT_MEDIACODEC_YUV :
                                 p->raw_420_sidecar ? IMGFMT_YUV420_PACK10 :
@@ -1395,8 +1309,7 @@ static void raw_retire_release(struct ra_hwdec_mapper *mapper, int index)
     if (image.wrapped_tex)
         ra_tex_free(mapper->ra, &image.wrapped_tex);
     gl->DeleteTextures(1, &image.texture);
-    if (!image.cached_egl)
-        p->DestroyImageKHR(image.display, image.egl_image);
+    p->DestroyImageKHR(image.display, image.egl_image);
     o->AImage_delete(image.image);
     mp_image_unrefp(&image.source);
     p->image_deleted++;
@@ -1466,55 +1379,6 @@ static bool raw_create_next_external_texture(struct ra_hwdec_mapper *mapper)
     return true;
 }
 
-static bool egl_cache_image_in_flight(struct priv *p, EGLImageKHR image)
-{
-    if (p->egl_image == image)
-        return true;
-    for (int i = 0; i < p->retired_count; i++) {
-        if (p->retired[i].egl_image == image)
-            return true;
-    }
-    return false;
-}
-
-static void egl_cache_reap(struct ra_hwdec_mapper *mapper, bool all)
-{
-    struct priv *p = mapper->priv;
-    struct priv_owner *o = mapper->owner->priv;
-    if (!p->egl_cache_enabled)
-        return;
-
-    AHardwareBuffer *removed[MP_ARRAY_SIZE(o->removed_buffers)];
-    int removed_count = 0;
-    bool overflow = false;
-    mp_mutex_lock(&o->callback_lock);
-    removed_count = o->removed_count;
-    memcpy(removed, o->removed_buffers, removed_count * sizeof(removed[0]));
-    o->removed_count = 0;
-    overflow = o->removed_overflow;
-    o->removed_overflow = false;
-    mp_mutex_unlock(&o->callback_lock);
-
-    for (int i = 0; i < MP_ARRAY_SIZE(p->egl_cache); i++) {
-        struct egl_cache_entry *entry = &p->egl_cache[i];
-        if (!entry->buffer)
-            continue;
-        for (int j = 0; j < removed_count; j++) {
-            if (entry->buffer == removed[j])
-                entry->removed = true;
-        }
-        if (overflow)
-            entry->removed = true;
-        if ((all || entry->removed) &&
-            (all || !egl_cache_image_in_flight(p, entry->image))) {
-            p->DestroyImageKHR(entry->display, entry->image);
-            p->AHardwareBuffer_release(entry->buffer);
-            *entry = (struct egl_cache_entry){0};
-            p->egl_cache_evictions++;
-        }
-    }
-}
-
 static void mapper_uninit(struct ra_hwdec_mapper *mapper)
 {
     struct priv *p = mapper->priv;
@@ -1528,8 +1392,6 @@ static void mapper_uninit(struct ra_hwdec_mapper *mapper)
     }
 
     o->AImageReader_setImageListener(o->reader, NULL);
-    if (p->egl_cache_enabled)
-        o->AImageReader_setBufferRemovedListener(o->reader, NULL);
     mp_mutex_lock(&o->callback_lock);
     o->callback_mapper = NULL;
     while (o->callbacks_active)
@@ -1559,26 +1421,6 @@ static void mapper_uninit(struct ra_hwdec_mapper *mapper)
                 p->empty_acquires, p->image != NULL, p->egl_image != NULL);
     }
 
-    if (p->cached_frame) {
-        gl->Finish();
-        if (p->egl_image) {
-            if (!p->current_egl_cached)
-                p->DestroyImageKHR(eglGetCurrentDisplay(), p->egl_image);
-            p->egl_image = NULL;
-            p->current_egl_cached = false;
-        }
-        if (p->image) {
-            o->AImage_delete(p->image);
-            p->image_deleted++;
-            p->image = NULL;
-        }
-        mp_image_unrefp(&p->cached_frame);
-    }
-    p5_section_log("P5_SAME_FRAME",
-                   "final hits=%"PRIu64" evictions=%"PRIu64
-                   " acquired=%"PRIu64" deleted=%"PRIu64,
-                   p->same_frame_hits, p->same_frame_evictions,
-                   p->image_acquired, p->image_deleted);
     gl->DeleteTextures(1, &p->gl_texture);
     p->gl_texture = 0;
 
@@ -1593,20 +1435,6 @@ static void mapper_uninit(struct ra_hwdec_mapper *mapper)
     } else {
         ra_tex_free(mapper->ra, &mapper->tex[0]);
     }
-    if (p->egl_cache_enabled) {
-        gl->Finish();
-        egl_cache_reap(mapper, true);
-        p5_section_log("P5_EGL_CACHE_FINAL",
-                       "hits=%"PRIu64" misses=%"PRIu64" bypasses=%"PRIu64
-                       " evictions=%"PRIu64,
-                       p->egl_cache_hits, p->egl_cache_misses,
-                       p->egl_cache_bypasses, p->egl_cache_evictions);
-    }
-    if (p->ahb_lib) {
-        dlclose(p->ahb_lib);
-        p->ahb_lib = NULL;
-    }
-
     MP_WARN(mapper, "P5_IMAGE_FINAL acquired=%"PRIu64" deleted=%"PRIu64
             " current_image=%d retired=%d callbacks=%"PRIu64
             " empty_acquires=%"PRIu64" retire=%d\n",
@@ -1651,13 +1479,11 @@ static void mapper_unmap(struct ra_hwdec_mapper *mapper)
             .fence = p->raw_sample_fence,
             .texture = p->gl_texture,
             .wrapped_tex = p->direct_retire ? mapper->tex[0] : NULL,
-            .cached_egl = p->current_egl_cached,
         };
         if (p->direct_retire)
             mapper->tex[0] = NULL;
         p->image = NULL;
         p->egl_image = NULL;
-        p->current_egl_cached = false;
         p->raw_sample_fence = NULL;
         p->gl_texture = 0;
         p->raw_submitted = false;
@@ -1747,18 +1573,14 @@ static void mapper_unmap(struct ra_hwdec_mapper *mapper)
         }
     }
 
-    if (!p->same_frame_cache || !p->cached_frame) {
-        if (p->egl_image) {
-            if (!p->current_egl_cached)
-                p->DestroyImageKHR(eglGetCurrentDisplay(), p->egl_image);
-            p->egl_image = 0;
-            p->current_egl_cached = false;
-        }
-        if (p->image) {
-            o->AImage_delete(p->image);
-            p->image_deleted++;
-            p->image = NULL;
-        }
+    if (p->egl_image) {
+        p->DestroyImageKHR(eglGetCurrentDisplay(), p->egl_image);
+        p->egl_image = 0;
+    }
+    if (p->image) {
+        o->AImage_delete(p->image);
+        p->image_deleted++;
+        p->image = NULL;
     }
     p->raw_submitted = false;
     if (p->section_perf && ++p->section_frames % 250 == 0) {
@@ -1801,7 +1623,6 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
                 p->image = image.image;
                 p->egl_image = image.egl_image;
                 p->gl_texture = image.texture;
-                p->current_egl_cached = image.cached_egl;
                 mapper->tex[0] = image.wrapped_tex;
                 mp_image_unrefp(&image.source);
                 p->raw_submitted = true;
@@ -1810,21 +1631,7 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
             }
         }
         raw_retire_reap(mapper, 1);
-        egl_cache_reap(mapper, false);
         p->raw_retire_maps++;
-        if (p->raw_retire_maps <= 20 || p->raw_retire_maps % 50 == 0) {
-            void *log_lib = dlopen("liblog.so", RTLD_NOW | RTLD_LOCAL);
-            typedef int (*log_print_fn)(int, const char *, const char *, ...);
-            log_print_fn log_print = log_lib ? dlsym(log_lib, "__android_log_print") : NULL;
-            if (log_print)
-                log_print(6, "P5_RETIRE", "map=%"PRIu64" held=%d reaped=%"PRIu64" waits=%"PRIu64" wait_us_total=%"PRId64" fallbacks=%"PRIu64,
-                          p->raw_retire_maps, p->retired_count,
-                          p->raw_retire_reaped, p->raw_retire_waits,
-                          p->raw_retire_wait_ns / 1000,
-                          p->raw_retire_fallbacks);
-            if (log_lib)
-                dlclose(log_lib);
-        }
         if (!p->gl_texture && !raw_create_next_external_texture(mapper))
             return -1;
         if (p->direct_retire && !mapper->tex[0]) {
@@ -1882,28 +1689,6 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
         if (mapper->src->imgfmt != IMGFMT_MEDIACODEC)
             return -1;
         AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)mapper->src->planes[3];
-        if (p->same_frame_cache && p->cached_frame) {
-            if (p->image && p->egl_image &&
-                p->cached_frame->planes[3] == mapper->src->planes[3] &&
-                p->cached_frame->pts == mapper->src->pts) {
-                p->same_frame_hits++;
-                p->raw_submitted = true;
-                p5_section_log("P5_SAME_FRAME", "hit=%"PRIu64" pts=%.9f",
-                               p->same_frame_hits, mapper->src->pts);
-                return 0;
-            }
-            if (p->egl_image) {
-                p->DestroyImageKHR(eglGetCurrentDisplay(), p->egl_image);
-                p->egl_image = NULL;
-            }
-            if (p->image) {
-                o->AImage_delete(p->image);
-                p->image_deleted++;
-                p->image = NULL;
-            }
-            mp_image_unrefp(&p->cached_frame);
-            p->same_frame_evictions++;
-        }
         if (p->image_timeline && p->image_acquired < 12)
             p5_section_log("P5_TIMELINE", "release_begin pts=%.9f mono_us=%"PRId64,
                            mapper->src->pts, mp_time_ns() / 1000);
@@ -1988,25 +1773,6 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
             p->timeline_followup = false;
     }
     p->image_acquired++;
-    if (p->image_acquired <= 3 || p->image_acquired % 250 == 0)
-        MP_WARN(mapper, "P5_IMAGE_COUNT acquired=%"PRIu64" deleted=%"PRIu64
-                " current_image=%d retired=%d callbacks=%"PRIu64
-                " empty_acquires=%"PRIu64" retire=%d pts=%.9f\n",
-                p->image_acquired, p->image_deleted, p->image != NULL,
-                p->retired_count, p->image_callbacks, p->empty_acquires,
-                p->raw_retire, mapper->src->pts);
-
-    if (p->image_acquired <= 3 || p->image_acquired % 250 == 0) {
-        char image_count_line[256];
-        snprintf(image_count_line, sizeof(image_count_line),
-                 "P5_IMAGE_COUNT acquired=%"PRIu64" deleted=%"PRIu64
-                 " current_image=%d retired=%d callbacks=%"PRIu64
-                 " empty_acquires=%"PRIu64" retire=%d pts=%.9f",
-                 p->image_acquired, p->image_deleted, p->image != NULL,
-                 p->retired_count, p->image_callbacks, p->empty_acquires,
-                 p->raw_retire, mapper->src->pts);
-        raw_stage(image_count_line);
-    }
 
     AHardwareBuffer *hwbuf = NULL;
     ret = o->AImage_getHardwareBuffer(p->image, &hwbuf);
@@ -2068,11 +1834,6 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
             }
             return -1;
         }
-        if (p->raw_logged++ < 5)
-            MP_WARN(mapper, "P5 raw YUV frame=%d pts=%.9f image_ns=%"PRId64" crop=%d,%d,%d,%d buffer=%ux%u format=%u\n",
-                    p->raw_logged, mapper->src->pts, image_ns,
-                    crop.left, crop.top, crop.right, crop.bottom,
-                    d.width, d.height, d.format);
     } else if (mapper->tex[0]->params.w != d.width ||
                mapper->tex[0]->params.h != d.height) {
         MP_VERBOSE(p, "Texture dimensions changed to %dx%d\n", d.width, d.height);
@@ -2084,61 +1845,25 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     const EGLint raw_attribs[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
     int64_t create_wall = p->section_perf ? mp_time_ns() : 0;
     int64_t create_cpu = p->section_perf ? p5_mapper_cpu_ns() : 0;
-    p->current_egl_cached = false;
-    if (p->egl_cache_enabled) {
-        for (int i = 0; i < MP_ARRAY_SIZE(p->egl_cache); i++) {
-            struct egl_cache_entry *entry = &p->egl_cache[i];
-            if (entry->buffer == hwbuf && !entry->removed &&
-                entry->display == eglGetCurrentDisplay()) {
-                p->egl_image = entry->image;
-                p->current_egl_cached = true;
-                p->egl_cache_hits++;
-                break;
-            }
-        }
-    }
-    if (!p->egl_image) {
-        EGLClientBuffer buf = p->GetNativeClientBufferANDROID(hwbuf);
-        if (!buf)
-            return -1;
-        p->egl_image = p->CreateImageKHR(eglGetCurrentDisplay(),
-            EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, buf,
-            p->raw_yuv ? raw_attribs : basic_attribs);
-        if (!p->egl_image)
-            return -1;
-        if (p->egl_cache_enabled) {
-            p->egl_cache_misses++;
-            int slot = -1;
-            for (int i = 0; i < MP_ARRAY_SIZE(p->egl_cache); i++) {
-                if (!p->egl_cache[i].buffer) {
-                    slot = i;
-                    break;
-                }
-            }
-            if (slot >= 0) {
-                p->AHardwareBuffer_acquire(hwbuf);
-                p->egl_cache[slot] = (struct egl_cache_entry){
-                    .buffer = hwbuf,
-                    .image = p->egl_image,
-                    .display = eglGetCurrentDisplay(),
-                };
-                p->current_egl_cached = true;
-            } else {
-                p->egl_cache_bypasses++;
-            }
-        }
-    }
+    EGLClientBuffer buf = p->GetNativeClientBufferANDROID(hwbuf);
+    if (!buf)
+        return -1;
+    p->egl_image = p->CreateImageKHR(eglGetCurrentDisplay(),
+        EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, buf,
+        p->raw_yuv ? raw_attribs : basic_attribs);
+    if (!p->egl_image)
+        return -1;
     if (p->section_perf) {
         p->section_create_wall_ns += mp_time_ns() - create_wall;
         p->section_create_cpu_ns += p5_mapper_cpu_ns() - create_cpu;
     }
 
     if (p->raw_yuv) {
-        GLint old_active, old_external;
+        // Bound the optional raw FBO diagnostics even when direct sampling
+        // is unavailable. The old first-frame log also advanced this count.
         if (p->raw_logged <= 5)
-            MP_WARN(mapper, "P5_RAW_GL before_import ctx=%p display=%p format=%u usage=%"PRIu64" egl_target=%p gl_error=%p\n",
-                    eglGetCurrentContext(), eglGetCurrentDisplay(), d.format,
-                    (uint64_t)d.usage, p->EGLImageTargetTexture2DOES, gl->GetError);
+            p->raw_logged++;
+        GLint old_active, old_external;
         gl->GetIntegerv(GL_ACTIVE_TEXTURE, &old_active);
         gl->ActiveTexture(GL_TEXTURE0);
         gl->GetIntegerv(GL_TEXTURE_BINDING_EXTERNAL_OES, &old_external);
@@ -2150,23 +1875,8 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
             p->section_bind_wall_ns += mp_time_ns() - bind_wall;
             p->section_bind_cpu_ns += p5_mapper_cpu_ns() - bind_cpu;
         }
-        if (p->raw_logged <= 5)
-            MP_WARN(mapper, "P5_RAW_GL after_import ctx=%p egl_error=%x\n",
-                    eglGetCurrentContext(), eglGetError());
         int64_t submit_start_ns = p->raw_perf ? mp_time_ns() : 0;
         GLenum import_error = gl->GetError();
-        if (p->raw_logged <= 5) {
-            void *log_lib = dlopen("liblog.so", RTLD_NOW | RTLD_LOCAL);
-            typedef int (*log_print_fn)(int, const char *, const char *, ...);
-            log_print_fn log_print = log_lib ? dlsym(log_lib, "__android_log_print") : NULL;
-            if (log_print)
-                log_print(6, "P5_RAW_GL", "after_import error=0x%x ctx=%p format=0x%x",
-                          import_error, eglGetCurrentContext(), d.format);
-            if (log_lib)
-                dlclose(log_lib);
-        }
-        if (p->raw_logged <= 5)
-            MP_WARN(mapper, "P5_RAW_GL after_gl_error error=%x\n", import_error);
         bool ok = import_error == GL_NO_ERROR &&
                   (p->direct_yuv || raw_render(mapper, &crop, d.width, d.height));
         if (ok && p->direct_yuv)
@@ -2205,8 +1915,6 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
         gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
     }
 
-    if (p->same_frame_cache && p->direct_yuv && p->image && p->egl_image)
-        p->cached_frame = mp_image_new_ref(mapper->src);
     return 0;
 }
 
