@@ -89,6 +89,7 @@ struct priv_owner {
 };
 
 struct retired_image {
+    struct mp_image *source;
     AImage *image;
     EGLImageKHR egl_image;
     EGLDisplay display;
@@ -1397,6 +1398,7 @@ static void raw_retire_release(struct ra_hwdec_mapper *mapper, int index)
     if (!image.cached_egl)
         p->DestroyImageKHR(image.display, image.egl_image);
     o->AImage_delete(image.image);
+    mp_image_unrefp(&image.source);
     p->image_deleted++;
     for (int i = index + 1; i < p->retired_count; i++)
         p->retired[i - 1] = p->retired[i];
@@ -1642,6 +1644,7 @@ static void mapper_unmap(struct ra_hwdec_mapper *mapper)
             raw_retire_reap(mapper, 1);
         mp_assert(p->retired_count < MP_ARRAY_SIZE(p->retired));
         p->retired[p->retired_count++] = (struct retired_image){
+            .source = p->direct_retire ? mp_image_new_ref(mapper->src) : NULL,
             .image = p->image,
             .egl_image = p->egl_image,
             .display = eglGetCurrentDisplay(),
@@ -1780,6 +1783,32 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     p->raw_submitted = false;
 
     if (p->raw_retire) {
+        // A redraw may map one MediaCodec output more than once. Reuse its
+        // still-owned external texture instead of acquiring a nonexistent
+        // second AImage for the same codec buffer.
+        if (p->direct_retire) {
+            for (int i = 0; i < p->retired_count; i++) {
+                struct retired_image *held = &p->retired[i];
+                if (!held->source ||
+                    held->source->planes[3] != mapper->src->planes[3] ||
+                    held->source->pts != mapper->src->pts)
+                    continue;
+                struct retired_image image = *held;
+                for (int j = i + 1; j < p->retired_count; j++)
+                    p->retired[j - 1] = p->retired[j];
+                p->retired[--p->retired_count] = (struct retired_image){0};
+                gl->DeleteSync(image.fence);
+                p->image = image.image;
+                p->egl_image = image.egl_image;
+                p->gl_texture = image.texture;
+                p->current_egl_cached = image.cached_egl;
+                mapper->tex[0] = image.wrapped_tex;
+                mp_image_unrefp(&image.source);
+                p->raw_submitted = true;
+                p->raw_retire_maps++;
+                return 0;
+            }
+        }
         raw_retire_reap(mapper, 1);
         egl_cache_reap(mapper, false);
         p->raw_retire_maps++;
