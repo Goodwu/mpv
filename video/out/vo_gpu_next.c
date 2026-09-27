@@ -555,6 +555,9 @@ static pl_tex hwdec_get_tex(struct priv *p, int n)
         struct pl_opengl_wrap_params par = {
             .width = ratex->params.w,
             .height = ratex->params.h,
+            .sampler_type = ratex->params.external_yuv
+                          ? PL_SAMPLER_EXTERNAL_YUV
+                          : PL_SAMPLER_NORMAL,
         };
 
         ra_gl_get_format(ratex->params.format, &par.iformat,
@@ -1397,6 +1400,21 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         // Update dynamic hook parameters
         for (int i = 0; i < pars->params.num_hooks; i++)
             update_hook_opts_dynamic(p, p->hooks[i], frame->current);
+    }
+
+    // The libplacebo optimization has its own strict path checks and falls
+    // back to regular rendering whenever this frame needs other color work.
+    // Limit the default opt-in to Profile 5 rendered to an SDR output.
+    struct pl_color_map_params p5_sdr_color_map;
+    if (frame->current && frame->current->params.dv_profile == 5 &&
+        frame->current->params.repr.dovi &&
+        target.color.transfer == PL_COLOR_TRC_BT_1886 &&
+        params.color_map_params) {
+        p5_sdr_color_map = *params.color_map_params;
+        p5_sdr_color_map.gamut_mapping = &pl_gamut_map_clip;
+        params.color_map_params = &p5_sdr_color_map;
+        params.optimize_dovi_linear_decode = true;
+        params.downscaler = NULL;
     }
 
     // Render frame
