@@ -1920,10 +1920,12 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     media_status_t ret = AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE;
     int64_t acquire_wall = p->section_perf ? mp_time_ns() : 0;
     int64_t acquire_cpu = p->section_perf ? p5_mapper_cpu_ns() : 0;
+    bool image_notified = false;
     for (int attempt = 0; attempt < 10; attempt++) {
         mp_mutex_lock(&p->lock);
         if (!p->image_available)
             mp_cond_timedwait(&p->cond, &p->lock, MP_TIME_MS_TO_NS(10));
+        image_notified |= p->image_available;
         p->image_available = false;
         mp_mutex_unlock(&p->lock);
 
@@ -1949,6 +1951,11 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
         p->section_acquire_cpu_ns += p5_mapper_cpu_ns() - acquire_cpu;
     }
     if (ret != AMEDIA_OK) {
+        // The ordinary OES mapper can be asked to draw the same codec frame
+        // again without a fresh ImageReader callback. Keep its previous
+        // texture, as the upstream mapper does on a callback timeout.
+        if (!p->raw_yuv && !image_notified)
+            return 0;
         if (p->image_timeline) {
             p->timeline_failed_pts = mapper->src->pts;
             p->timeline_failed_us = mp_time_ns() / 1000;
