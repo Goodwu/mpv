@@ -493,6 +493,10 @@ static void retire_reap(struct ra_hwdec_mapper *mapper, int max_keep)
     struct priv *p = mapper->priv;
     GL *gl = ra_gl_get(mapper->ra);
     for (int i = 0; i < p->retired_count;) {
+        // Keep the most recent image available for an adjacent-frame redraw
+        // when MediaCodec flushes before that frame reaches ImageReader.
+        if (p->retired_count <= max_keep)
+            break;
         struct retired_image *image = &p->retired[i];
         GLenum status = gl->ClientWaitSync(image->fence,
                                            GL_SYNC_FLUSH_COMMANDS_BIT, 0);
@@ -826,6 +830,33 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
         p->section_acquire_cpu_ns += p5_mapper_cpu_ns() - acquire_cpu;
     }
     if (ret != AMEDIA_OK) {
+        // A codec flush can discard a just-released output before it reaches
+        // ImageReader. Keep the preceding image only for a nearby PTS; a seek
+        // or new stream must not inherit an unrelated picture.
+        if (p->direct_retire && p->retired_count > 0) {
+            struct retired_image *held = &p->retired[p->retired_count - 1];
+            double delta = mapper->src->pts - held->source->pts;
+            if (delta > 0.0 && delta <= 0.05) {
+                double previous_pts = held->source->pts;
+                struct retired_image image = *held;
+                p->retired[--p->retired_count] = (struct retired_image){0};
+                ra_tex_free(mapper->ra, &mapper->tex[0]);
+                gl->DeleteTextures(1, &p->gl_texture);
+                gl->DeleteSync(image.fence);
+                p->image = image.image;
+                p->egl_image = image.egl_image;
+                p->gl_texture = image.texture;
+                mapper->tex[0] = image.wrapped_tex;
+                mp_image_unrefp(&image.source);
+                p->sample_submitted = true;
+                p5_section_log("P5_TAIL_FALLBACK",
+                               "requested_pts=%.9f previous_pts=%.9f delta=%.9f",
+                               mapper->src->pts, previous_pts, delta);
+                MP_WARN(mapper, "ImageReader missed adjacent frame at pts=%.9f; displaying previous image\n",
+                        mapper->src->pts);
+                return 0;
+            }
+        }
         // The ordinary OES mapper can be asked to draw the same codec frame
         // again without a fresh ImageReader callback. Keep its previous
         // texture, as the upstream mapper does on a callback timeout.
