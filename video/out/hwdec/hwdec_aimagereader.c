@@ -30,6 +30,7 @@
 #include <media/NdkImageReader.h>
 #include <android/native_window_jni.h>
 #include <libavcodec/mediacodec.h>
+#include <libavutil/buffer.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_mediacodec.h>
 
@@ -115,6 +116,14 @@ struct priv {
     bool image_timeline;
     bool ahb_identity_probe;
     uint64_t ahb_identity_samples;
+    // The GLES external YUV sampler of 8-bit MediaCodec buffers normalizes
+    // the signal as code/255 while the Dolby Vision reshape domain assumes
+    // the 10-bit BL scale code/1023; 4*255/1023 != 1, so the sampled signal
+    // arrives inflated by 1023/1020. The exact compensation rescales the
+    // reshape pivots and polynomial/MMR coefficients accordingly.
+    bool dovi_rescale_needed;
+    bool dovi_rescale_applied;
+    void *dovi_rescale_last_image;
     double timeline_failed_pts;
     int64_t timeline_failed_us;
     bool timeline_followup;
@@ -910,6 +919,63 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     // Update texture size since it may differ
     AHardwareBuffer_Desc d;
     o->AHardwareBuffer_describe(hwbuf, &d);
+    {
+        static bool p5_ahb_format_logged;
+        if (!p5_ahb_format_logged) {
+            p5_ahb_format_logged = true;
+            p5_section_log("P5_AHB_FORMAT", "pts=%.9f format=0x%x usage=%"PRIu64" stride=%u layers=%u w=%u h=%u",
+                           mapper->src->pts, d.format, (uint64_t)d.usage,
+                           d.stride, d.layers, d.width, d.height);
+            // 0x325 = vendor NV12 (YCbCr_420_SP_VENUS class, 8-bit) observed
+            // on this device's OMX.hisi.video.decoder.hevc surface output.
+            p->dovi_rescale_needed = d.format == 0x325 || d.format == 0x23 ||
+                                     d.format == 0x32315659u;
+        }
+    }
+    // The GLES external YUV sampler of the 8-bit MediaCodec buffers hands the
+    // reshaper a signal normalized as code/255, which in the 10-bit BL
+    // reshape domain (code/1023) is inflated by 1023/1020. Compensate by
+    // rescaling the reshape pivots and polynomial/MMR coefficients of the
+    // frame's own DOVI metadata in place (exact substitution s = s'/k), so
+    // every consumer of the mp_image sees the corrected mapping.
+    if (p->direct_yuv && p->dovi_rescale_needed &&
+        mapper->src->dovi && mapper->src->params.repr.dovi &&
+        (void *) mapper->src->dovi->data == mapper->src->params.repr.dovi &&
+        p->dovi_rescale_last_image != mapper->src) {
+        struct pl_dovi_metadata *meta = (void *) mapper->src->dovi->data;
+        const float k = 1023.0f / 1020.0f;
+        p->dovi_rescale_last_image = mapper->src;
+        for (int c = 0; c < 3; c++) {
+            struct pl_reshape_data *comp = &meta->comp[c];
+            if (!comp->num_pivots)
+                continue;
+            for (int i = 0; i < comp->num_pivots; i++)
+                comp->pivots[i] *= k;
+            for (int i = 0; i + 1 < comp->num_pivots; i++) {
+                if (comp->method[i] == 0) {
+                    comp->poly_coeffs[i][1] /= k;
+                    comp->poly_coeffs[i][2] /= k * k;
+                } else if (comp->method[i] == 1) {
+                    for (int j = 0; j < 3 && j < comp->mmr_order[i]; j++) {
+                        // Per reshape order j the MMR basis holds the linear
+                        // sig terms (degree 1) and the sigX^(j+1) cross terms
+                        // (degree 2*(j+1)).
+                        for (int w = 0; w < 3; w++)
+                            comp->mmr_coeffs[i][j][w] /= k;
+                        float cross = k;
+                        for (int e = 0; e < 2 * (j + 1); e++)
+                            cross *= k;
+                        for (int w = 3; w < 6; w++)
+                            comp->mmr_coeffs[i][j][w] /= cross;
+                    }
+                }
+            }
+        }
+        if (!p->dovi_rescale_applied) {
+            p->dovi_rescale_applied = true;
+            p5_section_log("P5_DOVI_RESCALE", "enabled k=%.6f (8-bit external YUV buffer)", k);
+        }
+    }
     AImageCropRect crop = {0};
     if (p->direct_yuv) {
         int64_t image_ns = 0;
