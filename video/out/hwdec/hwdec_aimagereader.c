@@ -926,15 +926,20 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
             p5_section_log("P5_AHB_FORMAT", "pts=%.9f format=0x%x usage=%"PRIu64" stride=%u layers=%u w=%u h=%u",
                            mapper->src->pts, d.format, (uint64_t)d.usage,
                            d.stride, d.layers, d.width, d.height);
-            // 0x325 = vendor NV12 (YCbCr_420_SP_VENUS class, 8-bit) observed
-            // on this device's OMX.hisi.video.decoder.hevc surface output.
+            // 0x325 = the vendor Main10 (10-bit) layout this device's
+            // OMX.hisi.video.decoder.hevc surface output always uses, not an
+            // 8-bit downgrade; 0x23/YV12 are true 8-bit whose codes sit at x4
+            // in the same domain. In both cases the driver Y2Y external
+            // sampler effectively normalizes as code/1020, so the dovi
+            // rescale below applies to all of them.
             p->dovi_rescale_needed = d.format == 0x325 || d.format == 0x23 ||
                                      d.format == 0x32315659u;
         }
     }
-    // The GLES external YUV sampler of the 8-bit MediaCodec buffers hands the
-    // reshaper a signal normalized as code/255, which in the 10-bit BL
-    // reshape domain (code/1023) is inflated by 1023/1020. Compensate by
+    // The GLES external YUV sampler hands the reshaper a signal normalized
+    // as code/1020 (0x325 carries full 10-bit content; true 8-bit formats
+    // land on the same effective scale), which in the 10-bit BL reshape
+    // domain (code/1023) is inflated by 1023/1020. Compensate by
     // rescaling the reshape pivots and polynomial/MMR coefficients of the
     // frame's own DOVI metadata in place (exact substitution s = s'/k), so
     // every consumer of the mp_image sees the corrected mapping.
