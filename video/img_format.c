@@ -58,6 +58,9 @@ struct mp_imgfmt_entry {
                               {3 * (a), 0, 32 * (a)} }, }}
 
 static const struct mp_imgfmt_entry mp_imgfmt_list[] = {
+    // not in ffmpeg
+    // Pseudo format for the aimagereader external YUV sampler; comps are
+    // deliberately 8-bit (see img_format.h).
     [IMGFMT_MEDIACODEC_YUV - IMGFMT_CUST_BASE] = {
         .name = "mediacodec_yuv",
         .desc = {
@@ -65,7 +68,6 @@ static const struct mp_imgfmt_entry mp_imgfmt_list[] = {
             .comps = { {0, 0, 8}, {0, 8, 8}, {0, 16, 8} },
         },
     },
-    // not in ffmpeg
     [IMGFMT_VDPAU_OUTPUT - IMGFMT_CUST_BASE] = {
         .name = "vdpau_output",
         .desc = {

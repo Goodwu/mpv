@@ -299,7 +299,6 @@ enum mp_imgfmt {
 
     // Accessed with bit-shifts, uint32_t units.
     IMGFMT_RGB30,               // 2pad 10r 10g 10b (MSB to LSB)
-    IMGFMT_MEDIACODEC_YUV,      // External texture sampled as raw Y/U/V
 
     // Fringe formats for fringe RGB format repacking.
     IMGFMT_Y1,      // gray with 1 bit per pixel
@@ -316,6 +315,12 @@ enum mp_imgfmt {
     IMGFMT_VIDEOTOOLBOX,    // CVPixelBufferRef
     IMGFMT_VULKAN,          // VKImage
     IMGFMT_DRMPRIME,        // AVDRMFrameDescriptor
+    // Pseudo format: the aimagereader mapper outputs a single GL external
+    // texture sampled as raw Y/Cb/Cr (GL_EXT_YUV_target). The descriptor
+    // claims 8-bit comps on purpose; it only describes the sampler's
+    // normalized input domain, while the actual buffer precision is carried
+    // by mp_image_params.repr.bits.
+    IMGFMT_MEDIACODEC_YUV,
 
     // Generic pass-through of AV_PIX_FMT_*. Used for formats which don't have
     // a corresponding IMGFMT_ value.

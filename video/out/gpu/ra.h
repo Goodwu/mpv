@@ -146,7 +146,9 @@ struct ra_tex_params {
     bool non_normalized;    // hack for GL_TEXTURE_RECTANGLE macOS idiocy
                             // always set to false, except in macOS code
     bool external_oes;      // hack for GL_TEXTURE_EXTERNAL_OES idiocy
-    bool external_yuv;      // GL_EXT_YUV_target raw Y/Cb/Cr sampling
+    // hack for GL_EXT_YUV_target raw Y/Cb/Cr sampling; only consumed by
+    // vo_gpu_next (wrapped as libplacebo PL_SAMPLER_EXTERNAL_YUV)
+    bool external_yuv;
     // If non-NULL, the texture will be created with these contents. Using
     // this does *not* require setting host_mutable. Otherwise, the initial
     // data is undefined.

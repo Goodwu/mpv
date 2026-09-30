@@ -17,14 +17,11 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "config.h"
+
 #include <assert.h>
 #include <dlfcn.h>
 #include <math.h>
-#include <stdatomic.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <time.h>
-#include <sys/system_properties.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <media/NdkImageReader.h>
@@ -48,8 +45,20 @@ typedef void *EGLImageKHR;
 #define GL_TEXTURE_BINDING_EXTERNAL_OES 0x8D67
 #endif
 
-// The shared FFmpeg build still references this default-off stage probe flag.
-atomic_bool media_kit_stage_probe_enabled;
+// GLES external YUV samplers on this device's driver effectively normalize
+// buffer code values as code/1020 instead of the code/1023 the Dolby Vision
+// reshape domain assumes, so the reshaper input arrives inflated by 1023/1020.
+// This is a property of the driver's Y2Y sampling, not of the buffer format
+// itself: 0x325 is the vendor Main10 (10-bit) layout this device's
+// OMX.hisi.video.decoder.hevc surface output always uses (not an 8-bit
+// downgrade), while 0x23/YV12 are true 8-bit formats whose codes sit at x4
+// in the same sampling domain. Whether other drivers behave the same is
+// unverified; unlisted formats get k=1 (no correction).
+static const struct { uint32_t format; float k; } ahb_yuv_scales[] = {
+    { 0x325,                  1023.0f / 1020.0f },
+    { 0x23,                   1023.0f / 1020.0f },
+    { 0x32315659u /* YV12 */, 1023.0f / 1020.0f },
+};
 
 struct priv_owner {
     struct mp_hwdec_ctx hwctx;
@@ -103,38 +112,23 @@ struct priv {
     // split) and green blocks on drivers without implicit AHardwareBuffer
     // synchronization (observed on Adreno 512).
     bool buffer_retire;
-    bool rpu_hash_logged;
-    bool section_perf;
-    uint64_t section_frames;
-    int64_t section_acquire_wall_ns, section_acquire_cpu_ns;
-    int64_t section_create_wall_ns, section_create_cpu_ns;
-    int64_t section_bind_wall_ns, section_bind_cpu_ns;
-    int64_t section_finish_wall_ns, section_finish_cpu_ns;
     GLsync sample_fence;
     struct retired_image retired[2];
     int retired_count;
-    uint64_t retire_maps, retire_reaped, retire_waits;
-    uint64_t retire_fallbacks;
-    int64_t retire_wait_ns;
-    uint64_t image_callbacks;
-    uint64_t empty_acquires;
-    uint64_t image_acquired;
-    uint64_t image_deleted;
-    bool image_timeline;
-    bool ahb_identity_probe;
-    uint64_t ahb_identity_samples;
-    // The GLES external YUV sampler of 8-bit MediaCodec buffers normalizes
-    // the signal as code/255 while the Dolby Vision reshape domain assumes
-    // the 10-bit BL scale code/1023; 4*255/1023 != 1, so the sampled signal
-    // arrives inflated by 1023/1020. The exact compensation rescales the
-    // reshape pivots and polynomial/MMR coefficients accordingly.
-    bool dovi_rescale_needed;
-    bool dovi_rescale_applied;
-    void *dovi_rescale_last_image;
-    double timeline_failed_pts;
-    int64_t timeline_failed_us;
-    bool timeline_followup;
-    volatile bool sample_submitted;
+    // External-sampling domain correction for the dovi reshape, evaluated
+    // once per mapper from the first mapped AHardwareBuffer's format.
+    // Per-mapper (not process-global): a mapper rebuilt for the next file
+    // must re-evaluate it.
+    bool ahb_format_checked;
+    float dovi_rescale_k;
+    // Identity (codec buffer + pts) of the last frame whose dovi metadata
+    // was rescaled, so map retries and redraws never apply the correction
+    // twice. Keying on the mp_image pointer would be unreliable: remapping
+    // allocates a fresh struct, and freed structs get their addresses
+    // recycled for the next frame.
+    void *dovi_rescale_last_buffer;
+    double dovi_rescale_last_pts;
+    bool sample_submitted;
     AImage *image;
     EGLImageKHR egl_image;
 
@@ -150,28 +144,6 @@ struct priv {
     void (EGLAPIENTRY *EGLImageTargetTexture2DOES)(GLenum, GLeglImageOES);
 };
 
-static int64_t p5_mapper_cpu_ns(void)
-{
-    struct timespec ts = {0};
-    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
-    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
-}
-
-static void p5_section_log(const char *tag, const char *fmt, ...)
-{
-    void *lib = dlopen("liblog.so", RTLD_NOW | RTLD_LOCAL);
-    typedef int (*vprint_fn)(int, const char *, const char *, va_list);
-    vprint_fn vprint = lib ? dlsym(lib, "__android_log_vprint") : NULL;
-    if (vprint) {
-        va_list args;
-        va_start(args, fmt);
-        vprint(6, tag, fmt, args);
-        va_end(args);
-    }
-    if (lib)
-        dlclose(lib);
-}
-
 static const struct { const char *symbol; int offset; } lib_functions[] = {
     { "AImageReader_newWithUsage", offsetof(struct priv_owner, AImageReader_newWithUsage) },
     { "AImageReader_getWindow", offsetof(struct priv_owner, AImageReader_getWindow) },
@@ -182,6 +154,13 @@ static const struct { const char *symbol; int offset; } lib_functions[] = {
     { "AImage_delete", offsetof(struct priv_owner, AImage_delete) },
     { "AHardwareBuffer_describe", offsetof(struct priv_owner, AHardwareBuffer_describe) },
     { "ANativeWindow_toSurface", offsetof(struct priv_owner, ANativeWindow_toSurface) },
+    { NULL, 0 },
+};
+
+// Optional entry points; their absence only disables the P5 direct YUV path.
+static const struct { const char *symbol; int offset; } lib_functions_optional[] = {
+    { "AImage_getCropRect", offsetof(struct priv_owner, AImage_getCropRect) },
+    { "AImage_getTimestamp", offsetof(struct priv_owner, AImage_getTimestamp) },
     { NULL, 0 },
 };
 
@@ -219,6 +198,12 @@ static bool load_lib_functions(struct priv_owner *p, struct mp_log *log)
 
         *(void **) ((uint8_t*)p + lib_functions[i].offset) = fun;
     }
+    for (int i = 0; lib_functions_optional[i].symbol; i++) {
+        void *fun = dlsym(p->lib_handle, lib_functions_optional[i].symbol);
+        if (!fun)
+            fun = dlsym(RTLD_DEFAULT, lib_functions_optional[i].symbol);
+        *(void **) ((uint8_t*)p + lib_functions_optional[i].offset) = fun;
+    }
     return true;
 }
 
@@ -254,7 +239,15 @@ static int init(struct ra_hwdec *hw)
     else
         hw->glsl_extensions = es2_exts;
 
-    // dummy dimensions, AImageReader only transports hardware buffers
+    // dummy dimensions, AImageReader only transports hardware buffers.
+    // Retire protection holds one image beyond the frame being rendered
+    // (plus one for an adjacent-frame redraw), so three slots are tight but
+    // sufficient; the decoder-side frame request is clamped accordingly
+    // (get_req_frames). Requesting more slots (4-5) sounds safer but breaks
+    // codec start on vendor OMX decoders: OMX.hisi rejects the larger output
+    // buffer count demanded by the BufferQueue ("port(1) BufferCount error",
+    // followed by signalError on the output-port transition), observed on
+    // LYA-AL00 / Kirin 980. Keep 3 unless per-vendor limits are probed.
     media_status_t ret = p->AImageReader_newWithUsage(16, 16,
         AIMAGE_FORMAT_PRIVATE, AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE,
         3, &p->reader);
@@ -335,15 +328,10 @@ static void image_callback(void *context, AImageReader *reader)
         return;
 
     mp_mutex_lock(&p->lock);
-    p->image_callbacks++;
-    uint64_t callback_number = p->image_callbacks;
-    bool timeline = p->image_timeline;
     p->image_available = true;
     mp_cond_signal(&p->cond);
     mp_mutex_unlock(&p->lock);
-    if (timeline && callback_number <= 12)
-        p5_section_log("P5_TIMELINE", "callback n=%"PRIu64" mono_us=%"PRId64,
-                       callback_number, mp_time_ns() / 1000);
+
     mp_mutex_lock(&o->callback_lock);
     mp_assert(o->callbacks_active > 0);
     if (--o->callbacks_active == 0)
@@ -351,15 +339,59 @@ static void image_callback(void *context, AImageReader *reader)
     mp_mutex_unlock(&o->callback_lock);
 }
 
-static void raw_stage(const char *stage)
+static void configure_external_texture(GL *gl, bool direct_yuv)
 {
-    void *lib = dlopen("liblog.so", RTLD_NOW | RTLD_LOCAL);
-    typedef int (*log_print_fn)(int, const char *, const char *, ...);
-    log_print_fn log_print = lib ? dlsym(lib, "__android_log_print") : NULL;
-    if (log_print)
-        log_print(6, "P5_RAW_STAGE", "%s", stage);
-    if (lib)
-        dlclose(lib);
+    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER,
+                      direct_yuv ? GL_NEAREST : GL_LINEAR);
+    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER,
+                      direct_yuv ? GL_NEAREST : GL_LINEAR);
+    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+}
+
+static bool create_next_external_texture(struct ra_hwdec_mapper *mapper)
+{
+    struct priv *p = mapper->priv;
+    GL *gl = ra_gl_get(mapper->ra);
+    GLint old_active = 0, old_external = 0;
+    gl->GetIntegerv(GL_ACTIVE_TEXTURE, &old_active);
+    gl->ActiveTexture(GL_TEXTURE0);
+    gl->GetIntegerv(GL_TEXTURE_BINDING_EXTERNAL_OES, &old_external);
+    gl->GenTextures(1, &p->gl_texture);
+    if (!p->gl_texture) {
+        gl->ActiveTexture(old_active);
+        return false;
+    }
+    gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, p->gl_texture);
+    configure_external_texture(gl, p->direct_yuv);
+    gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, old_external);
+    gl->ActiveTexture(old_active);
+    if (gl->GetError() != GL_NO_ERROR) {
+        gl->DeleteTextures(1, &p->gl_texture);
+        p->gl_texture = 0;
+        return false;
+    }
+    return true;
+}
+
+static bool wrap_external_texture(struct ra_hwdec_mapper *mapper)
+{
+    struct priv *p = mapper->priv;
+    struct ra_tex_params params = {
+        .dimensions = 2,
+        .w = mapper->src_params.w,
+        .h = mapper->src_params.h,
+        .d = 1,
+        .format = ra_find_unorm_format(mapper->ra, 1, 4),
+        .render_src = true,
+        .src_linear = true,
+        .external_oes = true,
+        .external_yuv = p->direct_yuv,
+    };
+    if (!params.format || params.format->ctype != RA_CTYPE_UNORM)
+        return false;
+    mapper->tex[0] = ra_create_wrapped_tex(mapper->ra, &params, p->gl_texture);
+    return mapper->tex[0] != NULL;
 }
 
 static int mapper_init(struct ra_hwdec_mapper *mapper)
@@ -383,47 +415,24 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
         !p->GetNativeClientBufferANDROID || !p->EGLImageTargetTexture2DOES)
         return -1;
 
-    bool p5_auto_yuv = mapper->src_params.dv_profile == 5 &&
-                       mapper->src_params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
-                       mapper->src_params.repr.dovi;
-    p->direct_yuv = p5_auto_yuv;
-    char section_property[PROP_VALUE_MAX] = {0};
-    p->section_perf = p->direct_yuv &&
-        __system_property_get("debug.media_kit.p5_section_perf", section_property) > 0 &&
-        !strcmp(section_property, "1");
-    p5_section_log("P5_SECTION_INIT", "direct=%d enabled=%d property=%s",
-                   p->direct_yuv, p->section_perf, section_property);
+    // Direct raw Y/Cb/Cr sampling of the P5 BL buffer requires GLES3
+    // YUV_target, the crop/timestamp entry points and the libplacebo
+    // external YUV sampler (HAVE_PL_EXTERNAL_YUV); without any of these
+    // fall back to the standard OES import.
+#if HAVE_PL_EXTERNAL_YUV
+    p->direct_yuv = mapper->src_params.dv_profile == 5 &&
+                    mapper->src_params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
+                    mapper->src_params.repr.dovi;
+    if (p->direct_yuv && (gl->es < 300 ||
+                          !gl_check_extension(gl->extensions, "GL_EXT_YUV_target") ||
+                          !o->AImage_getCropRect || !o->AImage_getTimestamp)) {
+        MP_VERBOSE(mapper, "P5 direct YUV unavailable; falling back to standard OES import\n");
+        p->direct_yuv = false;
+    }
+#endif
     p->buffer_retire = gl->FenceSync && gl->ClientWaitSync &&
                        gl->DeleteSync && gl->Flush;
     p->direct_retire = p->direct_yuv && p->buffer_retire;
-    char timeline_property[PROP_VALUE_MAX] = {0};
-    p->image_timeline = p->direct_yuv &&
-        __system_property_get("debug.media_kit.p5_image_timeline",
-                              timeline_property) > 0 &&
-        !strcmp(timeline_property, "1");
-    char ahb_identity_property[PROP_VALUE_MAX] = {0};
-    p->ahb_identity_probe = p->direct_yuv &&
-        __system_property_get("debug.media_kit.p5_ahb_identity_probe",
-                              ahb_identity_property) > 0 &&
-        !strcmp(ahb_identity_property, "1");
-    p5_section_log("P5_DIRECT_RETIRE", "enabled=%d", p->direct_retire);
-    p5_section_log("P5_BUFFER_RETIRE", "enabled=%d", p->buffer_retire);
-    if (p->direct_yuv) {
-        if (mapper->src_params.repr.sys != PL_COLOR_SYSTEM_DOLBYVISION ||
-            !mapper->src_params.repr.dovi) {
-            MP_ERR(mapper, "P5 direct YUV requested without first-frame DOVI metadata\n");
-            return -1;
-        }
-        o->AImage_getCropRect = dlsym(o->lib_handle, "AImage_getCropRect");
-        o->AImage_getTimestamp = dlsym(o->lib_handle, "AImage_getTimestamp");
-        if (gl->es < 300 ||
-            !gl_check_extension(gl->extensions, "GL_EXT_YUV_target") ||
-            !o->AImage_getCropRect || !o->AImage_getTimestamp) {
-            MP_WARN(mapper, "P5 direct YUV unavailable; falling back to standard OES import\n");
-            p->direct_yuv = false;
-            p->direct_retire = false;
-        }
-    }
 
     AImageReader_ImageListener listener = {
         .context = o,
@@ -447,43 +456,28 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
     mapper->dst_params.hw_subfmt = 0;
     if (p->direct_yuv) {
         // External YUV sampling preserves normalized 10-bit BL code values.
+        // (The descriptor in img_format.c claims 8-bit comps on purpose:
+        // the format only describes the sampler's normalized input domain,
+        // not the buffer's 10-bit precision.)
         mapper->dst_params.repr.bits = (struct pl_bit_encoding) {
             .sample_depth = 10, .color_depth = 10,
         };
-        MP_WARN(mapper, "P5 direct external YUV sampler enabled\n");
+        MP_VERBOSE(mapper, "P5 direct external YUV sampler enabled\n");
     }
 
-    // texture creation
-    gl->GenTextures(1, &p->gl_texture);
-    gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, p->gl_texture);
-    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER,
-                      p->direct_yuv ? GL_NEAREST : GL_LINEAR);
-    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER,
-                      p->direct_yuv ? GL_NEAREST : GL_LINEAR);
-    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
-
-    struct ra_tex_params params = {
-        .dimensions = 2,
-        .w = mapper->src_params.w,
-        .h = mapper->src_params.h,
-        .d = 1,
-        .format = ra_find_unorm_format(mapper->ra, 1, 4),
-        .render_src = true,
-        .src_linear = true,
-        .external_oes = true,
-        .external_yuv = p->direct_yuv,
-    };
-
-    if (params.format->ctype != RA_CTYPE_UNORM)
-        return -1;
-
-    mapper->tex[0] = ra_create_wrapped_tex(mapper->ra, &params, p->gl_texture);
-    if (!mapper->tex[0])
+    if (!create_next_external_texture(mapper) || !wrap_external_texture(mapper))
         return -1;
 
     return 0;
+}
+
+static struct retired_image retired_take(struct priv *p, int index)
+{
+    struct retired_image image = p->retired[index];
+    for (int i = index + 1; i < p->retired_count; i++)
+        p->retired[i - 1] = p->retired[i];
+    p->retired[--p->retired_count] = (struct retired_image){0};
+    return image;
 }
 
 static void retire_release(struct ra_hwdec_mapper *mapper, int index)
@@ -491,7 +485,7 @@ static void retire_release(struct ra_hwdec_mapper *mapper, int index)
     struct priv *p = mapper->priv;
     struct priv_owner *o = mapper->owner->priv;
     GL *gl = ra_gl_get(mapper->ra);
-    struct retired_image image = p->retired[index];
+    struct retired_image image = retired_take(p, index);
     gl->DeleteSync(image.fence);
     if (image.wrapped_tex)
         ra_tex_free(mapper->ra, &image.wrapped_tex);
@@ -499,77 +493,61 @@ static void retire_release(struct ra_hwdec_mapper *mapper, int index)
     p->DestroyImageKHR(image.display, image.egl_image);
     o->AImage_delete(image.image);
     mp_image_unrefp(&image.source);
-    p->image_deleted++;
-    for (int i = index + 1; i < p->retired_count; i++)
-        p->retired[i - 1] = p->retired[i];
-    p->retired[--p->retired_count] = (struct retired_image){0};
-    p->retire_reaped++;
 }
 
+// Release retired images until at most max_keep remain. A fence that does
+// not signal within roughly a frame period is treated as stuck; glFinish()
+// is a full completion barrier either way, so waiting longer only stalls
+// the render thread.
 static void retire_reap(struct ra_hwdec_mapper *mapper, int max_keep)
 {
     struct priv *p = mapper->priv;
     GL *gl = ra_gl_get(mapper->ra);
-    for (int i = 0; i < p->retired_count;) {
-        // Keep the most recent image available for an adjacent-frame redraw
-        // when MediaCodec flushes before that frame reaches ImageReader.
-        if (p->retired_count <= max_keep)
-            break;
-        struct retired_image *image = &p->retired[i];
+    while (p->retired_count > max_keep) {
+        struct retired_image *image = &p->retired[0];
         GLenum status = gl->ClientWaitSync(image->fence,
                                            GL_SYNC_FLUSH_COMMANDS_BIT, 0);
-        bool ready = status == GL_ALREADY_SIGNALED ||
-                     status == GL_CONDITION_SATISFIED;
-        if (!ready && p->retired_count > max_keep) {
-            int64_t start_ns = mp_time_ns();
+        if (status != GL_ALREADY_SIGNALED && status != GL_CONDITION_SATISFIED) {
             status = gl->ClientWaitSync(image->fence,
                                         GL_SYNC_FLUSH_COMMANDS_BIT,
-                                        1000000000ULL);
-            p->retire_waits++;
-            p->retire_wait_ns += mp_time_ns() - start_ns;
-            ready = status == GL_ALREADY_SIGNALED ||
-                    status == GL_CONDITION_SATISFIED;
-            if (!ready) {
+                                        MP_TIME_MS_TO_NS(50));
+            if (status != GL_ALREADY_SIGNALED && status != GL_CONDITION_SATISFIED)
                 gl->Finish();
-                p->retire_fallbacks++;
-                ready = true;
-            }
         }
-        if (ready)
-            retire_release(mapper, i);
-        else
-            i++;
+        retire_release(mapper, 0);
     }
 }
 
-static bool create_next_external_texture(struct ra_hwdec_mapper *mapper)
+// Take a retired image back as the mapper's current mapping, for redraws of
+// a frame whose codec buffer was already retired, or to restore the last
+// shown picture when a redraw arrives without a fresh ImageReader callback.
+// Whatever the mapper currently holds (e.g. the still-unbound texture of a
+// failed map attempt) is released first.
+static void mapper_adopt_retired(struct ra_hwdec_mapper *mapper,
+                                 struct retired_image image)
 {
     struct priv *p = mapper->priv;
+    struct priv_owner *o = mapper->owner->priv;
     GL *gl = ra_gl_get(mapper->ra);
-    GLint old_active = 0, old_external = 0;
-    gl->GetIntegerv(GL_ACTIVE_TEXTURE, &old_active);
-    gl->ActiveTexture(GL_TEXTURE0);
-    gl->GetIntegerv(GL_TEXTURE_BINDING_EXTERNAL_OES, &old_external);
-    gl->GenTextures(1, &p->gl_texture);
-    if (!p->gl_texture) {
-        gl->ActiveTexture(old_active);
-        return false;
-    }
-    gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, p->gl_texture);
-    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER,
-                      p->direct_yuv ? GL_NEAREST : GL_LINEAR);
-    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER,
-                      p->direct_yuv ? GL_NEAREST : GL_LINEAR);
-    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, old_external);
-    gl->ActiveTexture(old_active);
-    if (gl->GetError() != GL_NO_ERROR) {
+
+    gl->DeleteSync(image.fence);
+    ra_tex_free(mapper->ra, &mapper->tex[0]);
+    if (p->gl_texture)
         gl->DeleteTextures(1, &p->gl_texture);
-        p->gl_texture = 0;
-        return false;
+    if (p->egl_image) {
+        p->DestroyImageKHR(eglGetCurrentDisplay(), p->egl_image);
+        p->egl_image = NULL;
     }
-    return true;
+    if (p->image) {
+        o->AImage_delete(p->image);
+        p->image = NULL;
+    }
+    p->image = image.image;
+    p->egl_image = image.egl_image;
+    p->gl_texture = image.texture;
+    mapper->tex[0] = image.wrapped_tex;
+    mp_image_unrefp(&image.source);
+    p->sample_submitted = true;
 }
 
 static void mapper_uninit(struct ra_hwdec_mapper *mapper)
@@ -590,49 +568,24 @@ static void mapper_uninit(struct ra_hwdec_mapper *mapper)
     while (o->callbacks_active)
         mp_cond_wait(&o->callback_cond, &o->callback_lock);
     mp_mutex_unlock(&o->callback_lock);
-    if (p->buffer_retire) {
-        int held_before = p->retired_count;
+
+    if (p->buffer_retire)
         retire_reap(mapper, 0);
-        char final_line[256];
-        snprintf(final_line, sizeof(final_line),
-                 "P5_RETIRE_FINAL maps=%"PRIu64" reaped=%"PRIu64
-                 " held_before=%d held_after=%d waits=%"PRIu64
-                 " fallbacks=%"PRIu64" callbacks=%"PRIu64
-                 " empty_acquires=%"PRIu64" current_image=%d current_egl=%d",
-                 p->retire_maps, p->retire_reaped,
-                 held_before, p->retired_count, p->retire_waits,
-                 p->retire_fallbacks, p->image_callbacks,
-                 p->empty_acquires, p->image != NULL, p->egl_image != NULL);
-        raw_stage(final_line);
-        MP_WARN(mapper, "P5_RETIRE_FINAL maps=%"PRIu64" reaped=%"PRIu64
-                " held_before=%d held_after=%d waits=%"PRIu64
-                " fallbacks=%"PRIu64" callbacks=%"PRIu64
-                " empty_acquires=%"PRIu64" current_image=%d current_egl=%d\n",
-                p->retire_maps, p->retire_reaped,
-                held_before, p->retired_count, p->retire_waits,
-                p->retire_fallbacks, p->image_callbacks,
-                p->empty_acquires, p->image != NULL, p->egl_image != NULL);
+
+    if (p->egl_image) {
+        p->DestroyImageKHR(eglGetCurrentDisplay(), p->egl_image);
+        p->egl_image = NULL;
+    }
+    if (p->image) {
+        o->AImage_delete(p->image);
+        p->image = NULL;
     }
 
     gl->DeleteTextures(1, &p->gl_texture);
     p->gl_texture = 0;
 
     ra_tex_free(mapper->ra, &mapper->tex[0]);
-    MP_WARN(mapper, "P5_IMAGE_FINAL acquired=%"PRIu64" deleted=%"PRIu64
-            " current_image=%d retired=%d callbacks=%"PRIu64
-            " empty_acquires=%"PRIu64" retire=%d\n",
-            p->image_acquired, p->image_deleted, p->image != NULL,
-            p->retired_count, p->image_callbacks, p->empty_acquires,
-            p->direct_retire);
-    char image_final_line[256];
-    snprintf(image_final_line, sizeof(image_final_line),
-             "P5_IMAGE_FINAL acquired=%"PRIu64" deleted=%"PRIu64
-             " current_image=%d retired=%d callbacks=%"PRIu64
-             " empty_acquires=%"PRIu64" retire=%d",
-             p->image_acquired, p->image_deleted, p->image != NULL,
-             p->retired_count, p->image_callbacks, p->empty_acquires,
-             p->direct_retire);
-    raw_stage(image_final_line);
+
     mp_mutex_destroy(&p->lock);
     mp_cond_destroy(&p->cond);
 }
@@ -676,13 +629,7 @@ static void mapper_unmap(struct ra_hwdec_mapper *mapper)
         GL *gl = ra_gl_get(mapper->ra);
         // Keep the codec buffer alive until libplacebo has sampled the texture.
         // A missing fence falls back to the same completion barrier.
-        int64_t section_wall = p->section_perf ? mp_time_ns() : 0;
-        int64_t section_cpu = p->section_perf ? p5_mapper_cpu_ns() : 0;
         gl->Finish();
-        if (p->section_perf) {
-            p->section_finish_wall_ns += mp_time_ns() - section_wall;
-            p->section_finish_cpu_ns += p5_mapper_cpu_ns() - section_cpu;
-        }
     }
     if (p->sample_fence) {
         GL *gl = ra_gl_get(mapper->ra);
@@ -696,21 +643,9 @@ static void mapper_unmap(struct ra_hwdec_mapper *mapper)
     }
     if (p->image) {
         o->AImage_delete(p->image);
-        p->image_deleted++;
         p->image = NULL;
     }
     p->sample_submitted = false;
-    if (p->section_perf && ++p->section_frames % 250 == 0) {
-        p5_section_log("P5_SECTION_MAP", "frames=250 acquire_wall_us=%"PRId64" acquire_cpu_us=%"PRId64" create_wall_us=%"PRId64" create_cpu_us=%"PRId64" bind_wall_us=%"PRId64" bind_cpu_us=%"PRId64" finish_wall_us=%"PRId64" finish_cpu_us=%"PRId64,
-                p->section_acquire_wall_ns / 1000, p->section_acquire_cpu_ns / 1000,
-                p->section_create_wall_ns / 1000, p->section_create_cpu_ns / 1000,
-                p->section_bind_wall_ns / 1000, p->section_bind_cpu_ns / 1000,
-                p->section_finish_wall_ns / 1000, p->section_finish_cpu_ns / 1000);
-        p->section_acquire_wall_ns = p->section_acquire_cpu_ns = 0;
-        p->section_create_wall_ns = p->section_create_cpu_ns = 0;
-        p->section_bind_wall_ns = p->section_bind_cpu_ns = 0;
-        p->section_finish_wall_ns = p->section_finish_cpu_ns = 0;
-    }
 }
 
 static int mapper_map(struct ra_hwdec_mapper *mapper)
@@ -730,41 +665,14 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
                 held->source->planes[3] != mapper->src->planes[3] ||
                 held->source->pts != mapper->src->pts)
                 continue;
-            struct retired_image image = *held;
-            for (int j = i + 1; j < p->retired_count; j++)
-                p->retired[j - 1] = p->retired[j];
-            p->retired[--p->retired_count] = (struct retired_image){0};
-            gl->DeleteSync(image.fence);
-            p->image = image.image;
-            p->egl_image = image.egl_image;
-            p->gl_texture = image.texture;
-            mapper->tex[0] = image.wrapped_tex;
-            mp_image_unrefp(&image.source);
-            p->sample_submitted = true;
-            p->retire_maps++;
+            mapper_adopt_retired(mapper, retired_take(p, i));
             return 0;
         }
         retire_reap(mapper, 1);
-        p->retire_maps++;
         if (!p->gl_texture && !create_next_external_texture(mapper))
             return -1;
-        if (!mapper->tex[0]) {
-            struct ra_tex_params params = {
-                .dimensions = 2,
-                .w = mapper->src_params.w,
-                .h = mapper->src_params.h,
-                .d = 1,
-                .format = ra_find_unorm_format(mapper->ra, 1, 4),
-                .render_src = true,
-                .src_linear = true,
-                .external_oes = true,
-                .external_yuv = p->direct_yuv,
-            };
-            mapper->tex[0] = ra_create_wrapped_tex(mapper->ra, &params,
-                                                    p->gl_texture);
-            if (!mapper->tex[0])
-                return -1;
-        }
+        if (!mapper->tex[0] && !wrap_external_texture(mapper))
+            return -1;
     }
 
     if (p->direct_yuv &&
@@ -773,52 +681,17 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
         MP_ERR(mapper, "P5 direct YUV frame lacks DOVI metadata\n");
         return -1;
     }
-    if (p->direct_yuv && !p->rpu_hash_logged &&
-        fabs(mapper->src->pts - 10.0) < 0.00001) {
-        char prop[PROP_VALUE_MAX] = {0};
-        if (__system_property_get("debug.media_kit.p5_post_rpu_probe", prop) > 0 &&
-            !strcmp(prop, "1")) {
-            int found = 0;
-            for (int i = 0; i < mapper->src->num_ff_side_data; i++) {
-                struct mp_ff_side_data *sd = &mapper->src->ff_side_data[i];
-                if (sd->type != AV_FRAME_DATA_DOVI_RPU_BUFFER || !sd->buf)
-                    continue;
-                uint32_t hash = 2166136261U;
-                for (size_t j = 0; j < sd->buf->size; j++)
-                    hash = (hash ^ sd->buf->data[j]) * 16777619U;
-                char line[160];
-                snprintf(line, sizeof(line),
-                         "P5_RPU_ID pts=%.9f size=%zu hash=%08x",
-                         mapper->src->pts, sd->buf->size, hash);
-                raw_stage(line);
-                found++;
-            }
-            if (!found)
-                raw_stage("P5_RPU_ID pts=10 missing_raw_side_data");
-            p->rpu_hash_logged = true;
-        }
-    }
 
     {
         if (mapper->src->imgfmt != IMGFMT_MEDIACODEC)
             return -1;
         AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)mapper->src->planes[3];
-        if (p->image_timeline && p->image_acquired < 12)
-            p5_section_log("P5_TIMELINE", "release_begin pts=%.9f mono_us=%"PRId64,
-                           mapper->src->pts, mp_time_ns() / 1000);
-        int release_ret = av_mediacodec_release_buffer(buffer, 1);
-        if (p->image_timeline && p->image_acquired < 12)
-            p5_section_log("P5_TIMELINE",
-                           "release_end pts=%.9f src=%p codec_buffer=%p ret=%d mono_us=%"PRId64,
-                           mapper->src->pts, (void *)mapper->src,
-                           (void *)buffer, release_ret, mp_time_ns() / 1000);
+        av_mediacodec_release_buffer(buffer, 1);
     }
 
     // A queued callback does not guarantee an image is still available.
     // Retry this transient state without spinning the VO.
     media_status_t ret = AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE;
-    int64_t acquire_wall = p->section_perf ? mp_time_ns() : 0;
-    int64_t acquire_cpu = p->section_perf ? p5_mapper_cpu_ns() : 0;
     bool image_notified = false;
     for (int attempt = 0; attempt < 10; attempt++) {
         mp_mutex_lock(&p->lock);
@@ -828,26 +701,9 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
         p->image_available = false;
         mp_mutex_unlock(&p->lock);
 
-        int64_t attempt_us = p->image_timeline ? mp_time_ns() / 1000 : 0;
         ret = o->AImageReader_acquireLatestImage(o->reader, &p->image);
-        if (p->image_timeline && (p->image_acquired < 12 ||
-                                  ret != AMEDIA_OK || p->timeline_followup)) {
-            mp_mutex_lock(&p->lock);
-            uint64_t callbacks_snapshot = p->image_callbacks;
-            mp_mutex_unlock(&p->lock);
-            p5_section_log("P5_TIMELINE",
-                           "acquire attempt=%d pts=%.9f start_us=%"PRId64
-                           " end_us=%"PRId64" ret=%d callbacks=%"PRIu64,
-                           attempt + 1, mapper->src->pts, attempt_us,
-                           mp_time_ns() / 1000, ret, callbacks_snapshot);
-        }
         if (ret != AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE)
             break;
-        p->empty_acquires++;
-    }
-    if (p->section_perf) {
-        p->section_acquire_wall_ns += mp_time_ns() - acquire_wall;
-        p->section_acquire_cpu_ns += p5_mapper_cpu_ns() - acquire_cpu;
     }
     if (ret != AMEDIA_OK) {
         // A codec flush can discard a just-released output before it reaches
@@ -857,67 +713,37 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
             struct retired_image *held = &p->retired[p->retired_count - 1];
             double delta = mapper->src->pts - held->source->pts;
             if (delta > 0.0 && delta <= 0.05) {
-                double previous_pts = held->source->pts;
-                struct retired_image image = *held;
-                p->retired[--p->retired_count] = (struct retired_image){0};
-                ra_tex_free(mapper->ra, &mapper->tex[0]);
-                gl->DeleteTextures(1, &p->gl_texture);
-                gl->DeleteSync(image.fence);
-                p->image = image.image;
-                p->egl_image = image.egl_image;
-                p->gl_texture = image.texture;
-                mapper->tex[0] = image.wrapped_tex;
-                mp_image_unrefp(&image.source);
-                p->sample_submitted = true;
-                p5_section_log("P5_TAIL_FALLBACK",
-                               "requested_pts=%.9f previous_pts=%.9f delta=%.9f",
-                               mapper->src->pts, previous_pts, delta);
+                mapper_adopt_retired(mapper,
+                                     retired_take(p, p->retired_count - 1));
                 MP_WARN(mapper, "ImageReader missed adjacent frame at pts=%.9f; displaying previous image\n",
                         mapper->src->pts);
                 return 0;
             }
         }
         // The ordinary OES mapper can be asked to draw the same codec frame
-        // again without a fresh ImageReader callback. Keep its previous
-        // texture, as the upstream mapper does on a callback timeout. The
-        // retained image will be sampled again by this draw, so unmap must
-        // keep treating it as submitted.
+        // again without a fresh ImageReader callback. Upstream keeps the
+        // previous texture in that case; retiring moved that texture (and
+        // its image) out of the mapper, so restore the most recently
+        // retired image instead of sampling an empty external texture.
         if (!p->direct_yuv && !image_notified) {
-            p->sample_submitted = true;
+            if (p->retired_count > 0) {
+                mapper_adopt_retired(mapper,
+                                     retired_take(p, p->retired_count - 1));
+            } else {
+                // Nothing to restore (e.g. the very first frame); keep
+                // whatever texture the mapper still holds.
+                p->sample_submitted = true;
+            }
             return 0;
         }
-        if (p->image_timeline) {
-            p->timeline_failed_pts = mapper->src->pts;
-            p->timeline_failed_us = mp_time_ns() / 1000;
-            p->timeline_followup = true;
-        }
         mp_mutex_lock(&p->lock);
-        uint64_t callbacks = p->image_callbacks;
         bool notification_pending = p->image_available;
         mp_mutex_unlock(&p->lock);
-        MP_ERR(mapper, "acquireLatestImage failed after retry: %d pts=%.9f callbacks=%"PRIu64
-               " empty_acquires=%"PRIu64" notification_pending=%d retired=%d maps=%"PRIu64"\n",
-               ret, mapper->src->pts, callbacks, p->empty_acquires,
-               notification_pending, p->retired_count, p->retire_maps);
+        MP_ERR(mapper, "acquireLatestImage failed after retry: %d pts=%.9f notification_pending=%d\n",
+               ret, mapper->src->pts, notification_pending);
         return -1;
     }
     mp_assert(p->image);
-    if (p->image_timeline &&
-        (p->image_acquired < 12 || p->timeline_followup)) {
-        int64_t image_ns = -1;
-        media_status_t image_ts_ret = o->AImage_getTimestamp(p->image, &image_ns);
-        p5_section_log("P5_TIMELINE",
-                       "acquire_ok target_pts=%.9f image_ts_ns=%"PRId64
-                       " ts_ret=%d mono_us=%"PRId64
-                       " prior_failed_pts=%.9f since_failed_us=%"PRId64,
-                       mapper->src->pts, image_ns, image_ts_ret,
-                       mp_time_ns() / 1000, p->timeline_failed_pts,
-                       p->timeline_followup ?
-                           mp_time_ns() / 1000 - p->timeline_failed_us : -1);
-        if (p->timeline_followup)
-            p->timeline_followup = false;
-    }
-    p->image_acquired++;
 
     AHardwareBuffer *hwbuf = NULL;
     ret = o->AImage_getHardwareBuffer(p->image, &hwbuf);
@@ -926,50 +752,47 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
         return -1;
     }
     mp_assert(hwbuf);
-    if (p->ahb_identity_probe && ++p->ahb_identity_samples <= 120)
-        p5_section_log("P5_AHB_IDENTITY", "sample=%"PRIu64" pts=%.9f ahb=%p image=%p",
-                       p->ahb_identity_samples, mapper->src->pts,
-                       (void *)hwbuf, (void *)p->image);
 
     // Update texture size since it may differ
     AHardwareBuffer_Desc d;
     o->AHardwareBuffer_describe(hwbuf, &d);
-    {
-        static bool p5_ahb_format_logged;
-        if (!p5_ahb_format_logged) {
-            p5_ahb_format_logged = true;
-            p5_section_log("P5_AHB_FORMAT", "pts=%.9f format=0x%x usage=%"PRIu64" stride=%u layers=%u w=%u h=%u",
-                           mapper->src->pts, d.format, (uint64_t)d.usage,
-                           d.stride, d.layers, d.width, d.height);
-            // 0x325 = the vendor Main10 (10-bit) layout this device's
-            // OMX.hisi.video.decoder.hevc surface output always uses, not an
-            // 8-bit downgrade; 0x23/YV12 are true 8-bit whose codes sit at x4
-            // in the same domain. In both cases the driver Y2Y external
-            // sampler effectively normalizes as code/1020, so the dovi
-            // rescale below applies to all of them.
-            p->dovi_rescale_needed = d.format == 0x325 || d.format == 0x23 ||
-                                     d.format == 0x32315659u;
+    if (!p->ahb_format_checked) {
+        p->ahb_format_checked = true;
+        p->dovi_rescale_k = 1.0f;
+        for (int i = 0; i < MP_ARRAY_SIZE(ahb_yuv_scales); i++) {
+            if (ahb_yuv_scales[i].format == d.format) {
+                p->dovi_rescale_k = ahb_yuv_scales[i].k;
+                break;
+            }
         }
+        MP_VERBOSE(mapper, "AHB format=0x%x stride=%u layers=%u %ux%u; dovi rescale k=%.6f\n",
+                   (unsigned)d.format, (unsigned)d.stride, (unsigned)d.layers,
+                   (unsigned)d.width, (unsigned)d.height, p->dovi_rescale_k);
     }
     // The GLES external YUV sampler hands the reshaper a signal normalized
-    // as code/1020 (0x325 carries full 10-bit content; true 8-bit formats
-    // land on the same effective scale), which in the 10-bit BL reshape
-    // domain (code/1023) is inflated by 1023/1020. Compensate by
-    // rescaling the reshape pivots and polynomial/MMR coefficients of the
-    // frame's own DOVI metadata in place (exact substitution s = s'/k), so
-    // every consumer of the mp_image sees the corrected mapping.
-    if (p->direct_yuv && p->dovi_rescale_needed &&
+    // as code/1020, which in the 10-bit BL reshape domain (code/1023) is
+    // inflated by 1023/1020. Compensate by rescaling the reshape pivots and
+    // polynomial/MMR coefficients of the frame's own DOVI metadata
+    // (substituting s = s'/k), so every consumer of the mp_image sees the
+    // corrected mapping.
+    if (p->direct_yuv && p->dovi_rescale_k != 1.0f &&
         mapper->src->dovi && mapper->src->params.repr.dovi &&
         (void *) mapper->src->dovi->data == mapper->src->params.repr.dovi &&
-        p->dovi_rescale_last_image != mapper->src) {
+        (mapper->src->planes[3] != p->dovi_rescale_last_buffer ||
+         mapper->src->pts != p->dovi_rescale_last_pts)) {
         struct pl_dovi_metadata *meta = (void *) mapper->src->dovi->data;
-        const float k = 1023.0f / 1020.0f;
-        p->dovi_rescale_last_image = mapper->src;
+        const float k = p->dovi_rescale_k;
+        p->dovi_rescale_last_buffer = mapper->src->planes[3];
+        p->dovi_rescale_last_pts = mapper->src->pts;
         for (int c = 0; c < 3; c++) {
             struct pl_reshape_data *comp = &meta->comp[c];
             if (!comp->num_pivots)
                 continue;
-            for (int i = 0; i < comp->num_pivots; i++)
+            // Interior pivots select the reshape segment on the sampled
+            // (rescaled) input signal and must follow it; the first and
+            // last pivots only clamp the reshape output, which stays in
+            // the original domain.
+            for (int i = 1; i + 1 < comp->num_pivots; i++)
                 comp->pivots[i] *= k;
             for (int i = 0; i + 1 < comp->num_pivots; i++) {
                 if (comp->method[i] == 0) {
@@ -977,23 +800,19 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
                     comp->poly_coeffs[i][2] /= k * k;
                 } else if (comp->method[i] == 1) {
                     for (int j = 0; j < 3 && j < comp->mmr_order[i]; j++) {
-                        // Per reshape order j the MMR basis holds the linear
-                        // sig terms (degree 1) and the sigX^(j+1) cross terms
-                        // (degree 2*(j+1)).
+                        // Per reshape order j (0-based), the weight groups
+                        // multiply basis terms of degree j+1 (the linear
+                        // sig terms), 2*(j+1) (the sigX.xyz cross terms)
+                        // and 3*(j+1) (the sigX.w triple product).
+                        float k1 = powf(k, j + 1);
                         for (int w = 0; w < 3; w++)
-                            comp->mmr_coeffs[i][j][w] /= k;
-                        float cross = k;
-                        for (int e = 0; e < 2 * (j + 1); e++)
-                            cross *= k;
+                            comp->mmr_coeffs[i][j][w] /= k1;
                         for (int w = 3; w < 6; w++)
-                            comp->mmr_coeffs[i][j][w] /= cross;
+                            comp->mmr_coeffs[i][j][w] /= k1 * k1;
+                        comp->mmr_coeffs[i][j][6] /= k1 * k1 * k1;
                     }
                 }
             }
-        }
-        if (!p->dovi_rescale_applied) {
-            p->dovi_rescale_applied = true;
-            p5_section_log("P5_DOVI_RESCALE", "enabled k=%.6f (8-bit external YUV buffer)", k);
         }
     }
     AImageCropRect crop = {0};
@@ -1028,8 +847,6 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
 
     const EGLint basic_attribs[] = {EGL_NONE};
     const EGLint yuv_attribs[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
-    int64_t create_wall = p->section_perf ? mp_time_ns() : 0;
-    int64_t create_cpu = p->section_perf ? p5_mapper_cpu_ns() : 0;
     EGLClientBuffer buf = p->GetNativeClientBufferANDROID(hwbuf);
     if (!buf)
         return -1;
@@ -1038,10 +855,6 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
         p->direct_yuv ? yuv_attribs : basic_attribs);
     if (!p->egl_image)
         return -1;
-    if (p->section_perf) {
-        p->section_create_wall_ns += mp_time_ns() - create_wall;
-        p->section_create_cpu_ns += p5_mapper_cpu_ns() - create_cpu;
-    }
 
     if (p->direct_yuv) {
         GLint old_active, old_external;
@@ -1049,13 +862,7 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
         gl->ActiveTexture(GL_TEXTURE0);
         gl->GetIntegerv(GL_TEXTURE_BINDING_EXTERNAL_OES, &old_external);
         gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, p->gl_texture);
-        int64_t bind_wall = p->section_perf ? mp_time_ns() : 0;
-        int64_t bind_cpu = p->section_perf ? p5_mapper_cpu_ns() : 0;
         p->EGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, p->egl_image);
-        if (p->section_perf) {
-            p->section_bind_wall_ns += mp_time_ns() - bind_wall;
-            p->section_bind_cpu_ns += p5_mapper_cpu_ns() - bind_cpu;
-        }
         GLenum import_error = gl->GetError();
         if (import_error == GL_NO_ERROR)
             p->sample_submitted = true; // unmap waits for libplacebo's sample

@@ -177,6 +177,9 @@ struct gl_next_opts {
     int target_hint;
     int target_hint_mode;
     bool target_hint_strict;
+    // 0 = auto: only for frames imported through the Android external YUV
+    // hwdec path; 1 = yes: any Profile 5 frame; -1 = no.
+    int dovi_p5_fast_path;
     char **raw_opts;
 };
 
@@ -216,6 +219,8 @@ const struct m_sub_options gl_next_conf = {
         {"target-colorspace-hint", OPT_CHOICE(target_hint, {"auto", -1}, {"no", 0}, {"yes", 1})},
         {"target-colorspace-hint-mode", OPT_CHOICE(target_hint_mode, {"target", 0}, {"source", 1}, {"source-dynamic", 2})},
         {"target-colorspace-hint-strict", OPT_BOOL(target_hint_strict)},
+        {"dovi-p5-fast-path", OPT_CHOICE(dovi_p5_fast_path,
+            {"auto", 0}, {"yes", 1}, {"no", -1})},
         // No `target-lut-type` because we don't support non-RGB targets
         {"libplacebo-opts", OPT_KEYVALUELIST(raw_opts)},
         {0},
@@ -228,6 +233,7 @@ const struct m_sub_options gl_next_conf = {
         .image_subs_hdr_peak = PL_COLOR_SDR_WHITE,
         .target_hint = -1,
         .target_hint_strict = true,
+        .dovi_p5_fast_path = 0,
     },
     .size = sizeof(struct gl_next_opts),
     .change_flags = UPDATE_VIDEO,
@@ -552,6 +558,7 @@ static pl_tex hwdec_get_tex(struct priv *p, int n)
 
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
     if (ra_is_gl(ra) && pl_opengl_get(p->gpu)) {
+#if HAVE_PL_EXTERNAL_YUV
         struct pl_opengl_wrap_params par = {
             .width = ratex->params.w,
             .height = ratex->params.h,
@@ -559,6 +566,13 @@ static pl_tex hwdec_get_tex(struct priv *p, int n)
                           ? PL_SAMPLER_EXTERNAL_YUV
                           : PL_SAMPLER_NORMAL,
         };
+#else
+        struct pl_opengl_wrap_params par = {
+            .width = ratex->params.w,
+            .height = ratex->params.h,
+            .sampler_type = PL_SAMPLER_NORMAL,
+        };
+#endif
 
         ra_gl_get_format(ratex->params.format, &par.iformat,
                          &(GLenum){0}, &(GLenum){0});
@@ -1402,20 +1416,39 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             update_hook_opts_dynamic(p, p->hooks[i], frame->current);
     }
 
-    // The libplacebo optimization has its own strict path checks and falls
+    // Optional fast path for Profile 5 rendered to an SDR (BT.1886) target:
+    // the libplacebo optimization has its own strict path checks and falls
     // back to regular rendering whenever this frame needs other color work.
-    // Limit the default opt-in to Profile 5 rendered to an SDR output.
+    // --dovi-p5-fast-path=auto (the default) limits it to frames actually
+    // imported through the Android external YUV hwdec path, and never
+    // overrides a --gamut-mapping-mode or --dscale the user set explicitly.
+#if HAVE_PL_EXTERNAL_YUV && \
+    (HAVE_PL_DOV_LINEAR_OPTIMIZE || HAVE_PL_DOV_LINEAR_DISABLE)
     struct pl_color_map_params p5_sdr_color_map;
     if (frame->current && frame->current->params.dv_profile == 5 &&
         frame->current->params.repr.dovi &&
         target.color.transfer == PL_COLOR_TRC_BT_1886 &&
-        params.color_map_params) {
+        params.color_map_params &&
+        (p->next_opts->dovi_p5_fast_path == 1 ||
+         (p->next_opts->dovi_p5_fast_path == 0 &&
+          frame->current->imgfmt == IMGFMT_MEDIACODEC &&
+          p->hwdec_mapper &&
+          p->hwdec_mapper->dst_params.imgfmt == IMGFMT_MEDIACODEC_YUV))) {
         p5_sdr_color_map = *params.color_map_params;
-        p5_sdr_color_map.gamut_mapping = &pl_gamut_map_clip;
+        if (opts->tone_map.gamut_mode == GAMUT_AUTO)
+            p5_sdr_color_map.gamut_mapping = &pl_gamut_map_clip;
         params.color_map_params = &p5_sdr_color_map;
+#if HAVE_PL_DOV_LINEAR_OPTIMIZE
         params.optimize_dovi_linear_decode = true;
-        params.downscaler = NULL;
+#else
+        // Current libplacebo fork: the optimization is enabled by default,
+        // the switch only turns it off.
+        params.disable_dovi_linear_decode = false;
+#endif
+        if (opts->scaler[SCALER_DSCALE].kernel.function == SCALER_INHERIT)
+            params.downscaler = NULL;
     }
+#endif
 
     // Render frame
     if (!pl_render_image_mix(p->rr, &mix, &target, &params)) {

@@ -1303,6 +1303,29 @@ elif not features['gl'] and get_option('gl').enabled()
 endif
 
 
+# libplacebo
+# PL_SAMPLER_EXTERNAL_YUV only exists in the media-kit libplacebo fork; the
+# Android P5 direct YUV hwdec path and its vo_gpu_next fast path are compiled
+# out without it (standard OES import is used instead). The fork's dovi
+# linear-decode switch exists under two names: older versions used
+# `optimize_dovi_linear_decode` (opt-in), the current rework uses
+# `disable_dovi_linear_decode` (enabled by default). libplacebo structs have
+# no typedef, so the checks must use the `struct` tag (a bare
+# `pl_render_params` fails to compile in C and the feature would be
+# misdetected as absent). Upstream libplacebo has neither, so all three
+# checks are NO there.
+features += {'pl-external-yuv':
+    cc.has_header_symbol('libplacebo/gpu.h', 'PL_SAMPLER_EXTERNAL_YUV',
+                         dependencies: libplacebo)}
+features += {'pl-dovi-linear-optimize':
+    cc.has_member('struct pl_render_params', 'optimize_dovi_linear_decode',
+                  prefix: '#include <libplacebo/renderer.h>',
+                  dependencies: libplacebo)}
+features += {'pl-dovi-linear-disable':
+    cc.has_member('struct pl_render_params', 'disable_dovi_linear_decode',
+                  prefix: '#include <libplacebo/renderer.h>',
+                  dependencies: libplacebo)}
+
 # vulkan
 vulkan_opt = get_option('vulkan').require(
     libplacebo.get_variable('pl_has_vulkan', default_value: '0') == '1',

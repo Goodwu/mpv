@@ -1,0 +1,6 @@
+add `--dovi-p5-fast-path=<auto|yes|no>` to vo_gpu_next (media-kit fork
+addition, not part of upstream mpv): controls the Profile 5 -> SDR rendering
+fast path. `auto` (default) enables it only for frames imported through the
+Android external YUV hwdec path and never overrides an explicitly set
+`--gamut-mapping-mode` or `--dscale`; previously this fast path was always
+active for every Profile 5 frame on an SDR target.
