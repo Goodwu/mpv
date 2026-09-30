@@ -96,6 +96,13 @@ struct priv {
     GLuint gl_texture;
     bool direct_yuv;
     bool direct_retire;
+    // Retire-and-fence protection for every mapped codec buffer, not just
+    // the P5 direct YUV path. Without it the standard OES import releases
+    // the AImage at unmap while GL may still be sampling it; the decoder
+    // then rewrites the buffer mid-scan, visible as tearing (a diagonal
+    // split) and green blocks on drivers without implicit AHardwareBuffer
+    // synchronization (observed on Adreno 512).
+    bool buffer_retire;
     bool rpu_hash_logged;
     bool section_perf;
     uint64_t section_frames;
@@ -386,8 +393,9 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
         !strcmp(section_property, "1");
     p5_section_log("P5_SECTION_INIT", "direct=%d enabled=%d property=%s",
                    p->direct_yuv, p->section_perf, section_property);
-    p->direct_retire = p->direct_yuv &&
-        gl->FenceSync && gl->ClientWaitSync && gl->DeleteSync && gl->Flush;
+    p->buffer_retire = gl->FenceSync && gl->ClientWaitSync &&
+                       gl->DeleteSync && gl->Flush;
+    p->direct_retire = p->direct_yuv && p->buffer_retire;
     char timeline_property[PROP_VALUE_MAX] = {0};
     p->image_timeline = p->direct_yuv &&
         __system_property_get("debug.media_kit.p5_image_timeline",
@@ -399,6 +407,7 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
                               ahb_identity_property) > 0 &&
         !strcmp(ahb_identity_property, "1");
     p5_section_log("P5_DIRECT_RETIRE", "enabled=%d", p->direct_retire);
+    p5_section_log("P5_BUFFER_RETIRE", "enabled=%d", p->buffer_retire);
     if (p->direct_yuv) {
         if (mapper->src_params.repr.sys != PL_COLOR_SYSTEM_DOLBYVISION ||
             !mapper->src_params.repr.dovi) {
@@ -547,8 +556,10 @@ static bool create_next_external_texture(struct ra_hwdec_mapper *mapper)
         return false;
     }
     gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, p->gl_texture);
-    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER,
+                      p->direct_yuv ? GL_NEAREST : GL_LINEAR);
+    gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER,
+                      p->direct_yuv ? GL_NEAREST : GL_LINEAR);
     gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, old_external);
@@ -579,7 +590,7 @@ static void mapper_uninit(struct ra_hwdec_mapper *mapper)
     while (o->callbacks_active)
         mp_cond_wait(&o->callback_cond, &o->callback_lock);
     mp_mutex_unlock(&o->callback_lock);
-    if (p->direct_retire) {
+    if (p->buffer_retire) {
         int held_before = p->retired_count;
         retire_reap(mapper, 0);
         char final_line[256];
@@ -631,14 +642,14 @@ static void mapper_unmap(struct ra_hwdec_mapper *mapper)
     struct priv *p = mapper->priv;
     struct priv_owner *o = mapper->owner->priv;
 
-    if (p->direct_retire && p->image && p->egl_image &&
+    if (p->buffer_retire && p->image && p->egl_image &&
         p->sample_submitted && p->gl_texture && mapper->tex[0]) {
         GL *gl = ra_gl_get(mapper->ra);
         p->sample_fence = gl->FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         if (p->sample_fence)
             gl->Flush();
     }
-    if (p->direct_retire && p->image && p->egl_image &&
+    if (p->buffer_retire && p->image && p->egl_image &&
         p->sample_submitted && p->sample_fence && p->gl_texture) {
         if (p->retired_count >= MP_ARRAY_SIZE(p->retired))
             retire_reap(mapper, 1);
@@ -709,7 +720,7 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     GL *gl = ra_gl_get(mapper->ra);
     p->sample_submitted = false;
 
-    if (p->direct_retire) {
+    if (p->buffer_retire) {
         // A redraw may map one MediaCodec output more than once. Reuse its
         // still-owned external texture instead of acquiring a nonexistent
         // second AImage for the same codec buffer.
@@ -747,7 +758,7 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
                 .render_src = true,
                 .src_linear = true,
                 .external_oes = true,
-                .external_yuv = true,
+                .external_yuv = p->direct_yuv,
             };
             mapper->tex[0] = ra_create_wrapped_tex(mapper->ra, &params,
                                                     p->gl_texture);
@@ -868,9 +879,13 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
         }
         // The ordinary OES mapper can be asked to draw the same codec frame
         // again without a fresh ImageReader callback. Keep its previous
-        // texture, as the upstream mapper does on a callback timeout.
-        if (!p->direct_yuv && !image_notified)
+        // texture, as the upstream mapper does on a callback timeout. The
+        // retained image will be sampled again by this draw, so unmap must
+        // keep treating it as submitted.
+        if (!p->direct_yuv && !image_notified) {
+            p->sample_submitted = true;
             return 0;
+        }
         if (p->image_timeline) {
             p->timeline_failed_pts = mapper->src->pts;
             p->timeline_failed_us = mp_time_ns() / 1000;
@@ -1052,6 +1067,8 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
         gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, p->gl_texture);
         p->EGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, p->egl_image);
         gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+        if (gl->GetError() == GL_NO_ERROR)
+            p->sample_submitted = true;
     }
 
     return 0;
