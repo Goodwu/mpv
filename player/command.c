@@ -90,6 +90,11 @@
 #include <windows.h>
 #endif
 
+// Defined in video/out/vo_gpu_next.c. Scanned by mp_property_dovi_p5_pipeline
+// to report the presence of the dovi P5 fast-path option; same extern pattern
+// as options/options.c:83.
+extern const struct m_sub_options gl_next_conf;
+
 struct command_ctx {
     // All properties, terminated with a {0} item.
     struct m_property *properties;
@@ -3754,6 +3759,30 @@ static int mp_property_version(void *ctx, struct m_property *prop,
     return m_property_strdup_ro(action, arg, mpv_version);
 }
 
+// Read-only build capability probe: reports whether this build carries the
+// vo_gpu_next dovi P5 rescale/fast-path pipeline. This is derived from the
+// presence of the "dovi-p5-fast-path" option in gl_next_conf.opts instead of
+// hardcoding true, so if the option is ever removed from this fork the
+// property honestly reports false rather than advertising an unavailable
+// capability. Deliberately scans the option table (like Phase 1's
+// option-info probing) so it works on any initialized client API context,
+// with no playback state or vo required.
+static int mp_property_dovi_p5_pipeline(void *ctx, struct m_property *prop,
+                                        int action, void *arg)
+{
+    if (action != M_PROPERTY_GET && action != M_PROPERTY_GET_TYPE)
+        return M_PROPERTY_NOT_IMPLEMENTED;
+
+    bool found = false;
+    for (const struct m_option *o = gl_next_conf.opts; o && o->name; o++) {
+        if (strcmp(o->name, "dovi-p5-fast-path") == 0) {
+            found = true;
+            break;
+        }
+    }
+    return m_property_bool_ro(action, arg, found);
+}
+
 static int mp_property_configuration(void *ctx, struct m_property *prop,
                                      int action, void *arg)
 {
@@ -4571,6 +4600,7 @@ static const struct m_property mp_properties_base[] = {
     {"input-key-list", mp_property_keylist},
 
     {"mpv-version", mp_property_version},
+    {"dovi-p5-pipeline", mp_property_dovi_p5_pipeline},
     {"mpv-configuration", mp_property_configuration},
     {"ffmpeg-version", mp_property_ffmpeg},
     {"libass-version", mp_property_libass_version},

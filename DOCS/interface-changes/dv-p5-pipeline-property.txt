@@ -1,0 +1,4 @@
+add `dovi-p5-pipeline` (read-only build capability property: whether this
+build carries the vo_gpu_next dovi P5 rescale/fast-path pipeline, derived
+from the presence of the `dovi-p5-fast-path` option; intended for build
+capability probing on instances without Player/playback)
