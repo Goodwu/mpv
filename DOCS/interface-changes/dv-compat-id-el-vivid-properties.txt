@@ -1,0 +1,3 @@
+add `current-tracks/video/dolby-vision-compatibility-id`,
+`current-tracks/video/dolby-vision-el-present` (also available in track-list
+entries), and `video-params/hdr-vivid`

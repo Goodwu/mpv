@@ -127,6 +127,14 @@ struct mp_codec_params {
     bool dovi;
     uint8_t dv_profile;
     uint8_t dv_level;
+    // Fields of the DOVI configuration record, only valid if dovi is set
+    // (dovi means the record exists). FEL/MEL is not distinguished by the
+    // record, so dv_el_present only reports enhancement layer presence.
+    // dv_bl_signal_compatibility_id is -1 if the record exists but doesn't
+    // carry the field (0 is a valid value meaning "None" per the DV spec).
+    int dv_bl_signal_compatibility_id;
+    // -1 unknown, else 0/1.
+    int dv_el_present;
 
     // STREAM_VIDEO + STREAM_AUDIO
     int bits_per_coded_sample;

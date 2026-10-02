@@ -869,6 +869,7 @@ bool mp_image_params_equal(const struct mp_image_params *p1,
            p1->p_w == p2->p_w && p1->p_h == p2->p_h &&
            p1->force_window == p2->force_window &&
            p1->dv_profile == p2->dv_profile &&
+           p1->hdr_vivid == p2->hdr_vivid &&
            pl_color_space_equal(&p1->color, &p2->color) &&
            pl_color_repr_equal(&p1->repr, &p2->repr) &&
            p1->light == p2->light &&
@@ -887,6 +888,7 @@ bool mp_image_params_static_equal(const struct mp_image_params *p1,
     struct mp_image_params b = *p2;
     a.repr.dovi = b.repr.dovi = NULL;
     a.color.hdr = b.color.hdr = (struct pl_hdr_metadata){0};
+    a.hdr_vivid = b.hdr_vivid = false;
     return mp_image_params_equal(&a, &b);
 }
 
@@ -895,6 +897,7 @@ void mp_image_params_update_dynamic(struct mp_image_params *dst,
                                     bool has_peak_detect_values)
 {
     dst->repr.dovi = src->repr.dovi;
+    dst->hdr_vivid = src->hdr_vivid;
     // Don't overwrite peak-detected HDR metadata if available.
     float max_pq_y = dst->color.hdr.max_pq_y;
     float avg_pq_y = dst->color.hdr.avg_pq_y;
@@ -1173,6 +1176,10 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
         .clm = (void *)(clm ? clm->data : NULL),
         .dhp = (void *)(dhp ? dhp->data : NULL),
     });
+
+    // Only track HDR Vivid presence; the metadata itself is not mapped.
+    sd = av_frame_get_side_data(src, AV_FRAME_DATA_DYNAMIC_HDR_VIVID);
+    dst->params.hdr_vivid = !!sd;
 
     sd = av_frame_get_side_data(src, AV_FRAME_DATA_A53_CC);
     if (sd)

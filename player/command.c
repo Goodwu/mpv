@@ -2103,6 +2103,18 @@ static int get_track_entry(int item, int action, void *arg, void *ctx)
                         .unavailable = !p.dovi},
         {"dolby-vision-level", SUB_PROP_INT(p.dv_level),
                         .unavailable = !p.dovi},
+        // Unavailable without a DOVI configuration record (like the profile
+        // and level properties above). Unlike the container/bitstream fields,
+        // a record without the compatibility ID field reports 0 ("None" per
+        // the DV spec), so -1 never occurs with the current demuxers; keep it
+        // as the "unknown within an existing record" sentinel anyway.
+        {"dolby-vision-compatibility-id",
+                        SUB_PROP_INT(p.dv_bl_signal_compatibility_id),
+                        .unavailable = !p.dovi},
+        // The configuration record does not distinguish FEL/MEL; this only
+        // reports whether an enhancement layer is present at all.
+        {"dolby-vision-el-present", SUB_PROP_INT(p.dv_el_present),
+                        .unavailable = !p.dovi},
         {"metadata", SUB_PROP_KEYVALUE_LIST(tag_list),
                         .unavailable = !tags->num_keys},
         {0}
@@ -2492,6 +2504,11 @@ static int property_imgparams(const struct mp_image_params *p, int action, void 
         {"scene-max-g", SUB_PROP_FLOAT(hdr->scene_max[1]), .unavailable = !has_hdr10plus},
         {"scene-max-b", SUB_PROP_FLOAT(hdr->scene_max[2]), .unavailable = !has_hdr10plus},
         {"scene-avg",   SUB_PROP_FLOAT(hdr->scene_avg),    .unavailable = !has_hdr10plus},
+        // Per-frame presence of HDR Vivid dynamic metadata, like the HDR10+
+        // scene properties above. false means the frame definitively carried
+        // no such side data; the whole video-params property (including this
+        // entry) is unavailable before the first decoded frame.
+        {"hdr-vivid",   SUB_PROP_BOOL(p->hdr_vivid)},
         {"max-pq-y",    SUB_PROP_FLOAT(hdr->max_pq_y),     .unavailable = !has_cie_y},
         {"avg-pq-y",    SUB_PROP_FLOAT(hdr->avg_pq_y),     .unavailable = !has_cie_y},
         {"prim-red-x",   SUB_PROP_FLOAT(hdr->prim.red.x),  .unavailable = !custom_prim },

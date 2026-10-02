@@ -57,6 +57,10 @@ struct mp_image_params {
     // Container-declared Dolby Vision profile; zero means unavailable.
     // Per-frame RPU presence alone does not identify the profile.
     uint8_t dv_profile;
+    // The frame carried HDR Vivid dynamic metadata side data. Only the fact
+    // of presence is tracked; the metadata itself is not mapped. Per-frame
+    // dynamic state: excluded from mp_image_params_static_equal().
+    bool hdr_vivid;
 
     enum mp_csp_light light;
     enum pl_chroma_location chroma_location;
