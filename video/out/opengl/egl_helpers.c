@@ -60,6 +60,93 @@ typedef intptr_t EGLAttrib;
 #define EGL_COLOR_COMPONENT_TYPE_FIXED_EXT EGL_NONE
 #endif
 
+// EGL_EXT_yuv_surface tokens (local, MKS YUV diag branch only). Values are
+// copied verbatim from yuv_config_probe.c (Gate-1a forensics,
+// media-kit-build/lg-api24/lg-api24-realtime-gpu-diag-materials/yuv-probe),
+// which took them from the Khronos EGL registry text.
+#ifndef EGL_YUV_BUFFER_EXT
+#define EGL_YUV_BUFFER_EXT              0x3300
+#endif
+#ifndef EGL_YUV_ORDER_EXT
+#define EGL_YUV_ORDER_EXT               0x3301
+#endif
+#ifndef EGL_YUV_ORDER_YUV_EXT
+#define EGL_YUV_ORDER_YUV_EXT           0x3302
+#endif
+#ifndef EGL_YUV_NUMBER_OF_PLANES_EXT
+#define EGL_YUV_NUMBER_OF_PLANES_EXT    0x3311
+#endif
+#ifndef EGL_YUV_SUBSAMPLE_EXT
+#define EGL_YUV_SUBSAMPLE_EXT           0x3312
+#endif
+#ifndef EGL_YUV_SUBSAMPLE_4_2_0_EXT
+#define EGL_YUV_SUBSAMPLE_4_2_0_EXT     0x3313
+#endif
+#ifndef EGL_YUV_DEPTH_RANGE_EXT
+#define EGL_YUV_DEPTH_RANGE_EXT         0x3317
+#endif
+#ifndef EGL_YUV_DEPTH_RANGE_LIMITED_EXT
+#define EGL_YUV_DEPTH_RANGE_LIMITED_EXT 0x3318
+#endif
+#ifndef EGL_YUV_CSC_STANDARD_EXT
+#define EGL_YUV_CSC_STANDARD_EXT        0x330A
+#endif
+#ifndef EGL_YUV_CSC_STANDARD_601_EXT
+#define EGL_YUV_CSC_STANDARD_601_EXT    0x330B
+#endif
+#ifndef EGL_YUV_PLANE_BPP_EXT
+#define EGL_YUV_PLANE_BPP_EXT           0x331A
+#endif
+#ifndef EGL_YUV_PLANE_BPP_8_EXT
+#define EGL_YUV_PLANE_BPP_8_EXT         0x331C
+#endif
+
+// MKS YUV diag: the fixed NV12 window format (YCbCr_420_SP_VENUS family) and
+// the exact probed config on the LG-H870DS target. The branch accepts ONLY
+// config_id 49 — no other member of the visual-id family is substituted.
+#define MKS_YUV_DIAG_NATIVE_VISUAL_ID   0x7FA30C04
+#define MKS_YUV_DIAG_CONFIG_ID          49
+
+// MKS YUV diag: full runtime attribute assertion for the chosen YUV config.
+// Not just the visual id: buffer type, plane order/count, subsampling, range,
+// CSC and d0/s0/bpp8 must all match the probed config49 set. A failed query or
+// a value mismatch fails the branch (no automatic config substitution). All
+// failures log unconditionally at MP_ERR (Gate-1b forensics visibility).
+static bool mpegl_yuv_config_assert(struct ra_ctx *ctx, EGLDisplay display,
+                                    EGLConfig config)
+{
+    static const struct {
+        EGLint attr;
+        EGLint want;
+        const char *name;
+    } req[] = {
+        { EGL_COLOR_BUFFER_TYPE,        EGL_YUV_BUFFER_EXT,              "color_buffer_type" },
+        { EGL_YUV_ORDER_EXT,            EGL_YUV_ORDER_YUV_EXT,           "yuv_order" },
+        { EGL_YUV_NUMBER_OF_PLANES_EXT, 2,                               "yuv_planes" },
+        { EGL_YUV_SUBSAMPLE_EXT,        EGL_YUV_SUBSAMPLE_4_2_0_EXT,     "yuv_subsample" },
+        { EGL_YUV_DEPTH_RANGE_EXT,      EGL_YUV_DEPTH_RANGE_LIMITED_EXT, "yuv_depth_range" },
+        { EGL_YUV_CSC_STANDARD_EXT,     EGL_YUV_CSC_STANDARD_601_EXT,    "yuv_csc_standard" },
+        { EGL_YUV_PLANE_BPP_EXT,        EGL_YUV_PLANE_BPP_8_EXT,         "yuv_plane_bpp" },
+        { EGL_DEPTH_SIZE,               0,                               "depth_size" },
+        { EGL_STENCIL_SIZE,             0,                               "stencil_size" },
+        { EGL_SAMPLES,                  0,                               "samples" },
+    };
+    for (int n = 0; n < MP_ARRAY_SIZE(req); n++) {
+        EGLint v = -1;
+        if (!eglGetConfigAttrib(display, config, req[n].attr, &v)) {
+            MP_ERR(ctx, "YUV-DIAG: config49 attribute query failed: %s "
+                   "(error=0x%x)\n", req[n].name, eglGetError());
+            return false;
+        }
+        if (v != req[n].want) {
+            MP_ERR(ctx, "YUV-DIAG: config49 assertion failed: %s "
+                   "(got 0x%x, want 0x%x)\n", req[n].name, v, req[n].want);
+            return false;
+        }
+    }
+    return true;
+}
+
 struct mp_egl_config_attr {
     int attrib;
     const char *name;
@@ -143,6 +230,64 @@ const struct m_sub_options egl_conf = {
     .size = sizeof(struct egl_opts),
 };
 
+// YUV diag: select config49 by FULL ENUMERATION + direct per-config attribute
+// queries. Gate-1b evidence: the driver's eglChooseConfig attribute matching
+// returns 0 configs for EGL_COLOR_BUFFER_TYPE=YUV_BUFFER on this device, so
+// the attribute-matching path can never see the YUV configs. This is the last
+// single-variable step of A2a: same config49, same assertion set, only the
+// selection mechanism changes (eglChooseConfig -> eglGetConfigs + queries).
+// Exactly config_id 49 with visual 0x7FA30C04 and the full attribute set; any
+// deviation fails the branch with no fallback.
+static bool mpegl_yuv_find_config49(struct ra_ctx *ctx, EGLDisplay display,
+                                    EGLConfig *out)
+{
+    EGLint count = 0;
+    if (!eglGetConfigs(display, NULL, 0, &count) || count <= 0 ||
+        count > 1024) {
+        MP_ERR(ctx, "YUV-DIAG: eglGetConfigs count failed (error=0x%x)\n",
+               eglGetError());
+        return false;
+    }
+    EGLConfig *configs = talloc_array(NULL, EGLConfig, count);
+    EGLint got = 0;
+    if (!eglGetConfigs(display, configs, count, &got) || got <= 0) {
+        MP_ERR(ctx, "YUV-DIAG: eglGetConfigs enumeration failed (error=0x%x)\n",
+               eglGetError());
+        talloc_free(configs);
+        return false;
+    }
+    MP_ERR(ctx, "YUV-DIAG: enumerating %d configs for config49 "
+           "(visual 0x%x)\n", got, MKS_YUV_DIAG_NATIVE_VISUAL_ID);
+    bool found = false;
+    for (int n = 0; n < got; n++) {
+        EGLint cid = 0, vid = 0;
+        if (!eglGetConfigAttrib(display, configs[n], EGL_CONFIG_ID, &cid) ||
+            !eglGetConfigAttrib(display, configs[n], EGL_NATIVE_VISUAL_ID,
+                                &vid))
+            continue;
+        if (cid != MKS_YUV_DIAG_CONFIG_ID)
+            continue;
+        if (vid != MKS_YUV_DIAG_NATIVE_VISUAL_ID) {
+            MP_ERR(ctx, "YUV-DIAG: config49 assertion failed: native_visual_id "
+                   "(got 0x%x, want 0x%x); branch fails\n", vid,
+                   MKS_YUV_DIAG_NATIVE_VISUAL_ID);
+            break;
+        }
+        if (!mpegl_yuv_config_assert(ctx, display, configs[n]))
+            break;
+        *out = configs[n];
+        found = true;
+        MP_ERR(ctx, "YUV-DIAG: config49 selected (config_id=%d, "
+               "visual=0x%x) via full enumeration\n", cid, vid);
+        break;
+    }
+    talloc_free(configs);
+    if (!found)
+        MP_ERR(ctx, "YUV-DIAG: config49 not found among %d enumerated "
+               "configs; branch fails (no fallback)\n", got);
+    return found;
+}
+
 static bool create_context(struct ra_ctx *ctx, EGLDisplay display,
                            bool es, struct mpegl_cb cb, struct egl_opts *opts,
                            EGLContext *out_context, EGLConfig *out_config)
@@ -176,6 +321,28 @@ static bool create_context(struct ra_ctx *ctx, EGLDisplay display,
     EGLint r_size, g_size, b_size, a_size;
     unpack_format(opts->output_format, &r_size, &g_size, &b_size, &a_size, &request_float_fmt);
     bool has_float_format_ext = gl_check_extension(egl_exts, "EGL_EXT_pixel_format_float");
+
+    // YUV diag: bypass eglChooseConfig entirely (Gate-1b: the driver's
+    // attribute matching returns 0 configs for YUV_BUFFER). config49 is
+    // located by full enumeration + direct attribute queries; the selection
+    // is the ONLY changed variable — everything downstream (context creation,
+    // window surface) is untouched.
+    EGLConfig config = 0;
+    if (cb.yuv_diag_config) {
+        // Mutually exclusive with the RGB output-format logic below (its bit
+        // sizes are meaningless for a YUV config and are not applied).
+        if (opts->output_format)
+            MP_WARN(ctx, "YUV-DIAG: branch active; egl output-format ignored.\n");
+        if (!mpegl_yuv_find_config49(ctx, display, &config))
+            return false;
+        goto config_selected;
+    }
+
+    // Only the RGB path acts on output-format, so its float-request
+    // feasibility check sits behind the YUV bypass above: a YUV-armed
+    // context with a float output-format request and no
+    // EGL_EXT_pixel_format_float takes the YUV branch instead of failing
+    // here (output-format is ignored in YUV mode, as warned above).
     if (request_float_fmt && !has_float_format_ext) {
         MP_MSG(ctx, msgl, "Could not request floating point pixel format for %s!\n", name);
         return false;
@@ -235,10 +402,11 @@ static bool create_context(struct ra_ctx *ctx, EGLDisplay display,
         MP_MSG(ctx, msgl, "Could not refine EGLConfig for %s!\n", name);
         return false;
     }
-    EGLConfig config = configs[chosen];
+    config = configs[chosen];
 
     talloc_free(configs);
 
+config_selected:
     MP_DBG(ctx, "Chosen EGLConfig:\n");
     dump_egl_config(ctx->log, MSGL_DEBUG, display, config);
 

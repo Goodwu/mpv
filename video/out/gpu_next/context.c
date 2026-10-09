@@ -163,6 +163,17 @@ struct gpu_ctx *gpu_ctx_create(struct vo *vo, struct ra_ctx_opts *ctx_opts)
         ctx->swapchain = pl_opengl_create_swapchain(opengl, pl_opengl_swapchain_params(
             .max_swapchain_depth = vo->opts->swapchain_depth,
             .framebuffer.flipped = gl->flipped,
+#if HAVE_EGL_ANDROID
+            // MKS YUV diag (lab-gated, default off): when THIS Android EGL
+            // context took the YUV diag branch, point the libplacebo
+            // swapchain at its per-context high-precision RGB offscreen FBO
+            // instead of the YUV default framebuffer (RGB writes to a YUV
+            // target would be undefined). The final layout(yuv) pass to the
+            // YUV window runs at swap time in context_android.c. Returns 0
+            // (default framebuffer) for any context that did not take the
+            // branch, so this is a no-op for every non-diag build/run.
+            .framebuffer.id = mks_yuv_diag_swapchain_fbo(ctx->ra_ctx),
+#endif
         ));
         if (!ctx->swapchain)
             goto err_out;

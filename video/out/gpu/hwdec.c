@@ -37,6 +37,7 @@ extern const struct ra_hwdec_driver ra_hwdec_cuda;
 extern const struct ra_hwdec_driver ra_hwdec_drmprime;
 extern const struct ra_hwdec_driver ra_hwdec_drmprime_overlay;
 extern const struct ra_hwdec_driver ra_hwdec_aimagereader;
+extern const struct ra_hwdec_driver ra_hwdec_surfacetexture;
 extern const struct ra_hwdec_driver ra_hwdec_vulkan;
 
 const struct ra_hwdec_driver *const ra_hwdec_drivers[] = {
@@ -73,8 +74,9 @@ const struct ra_hwdec_driver *const ra_hwdec_drivers[] = {
     &ra_hwdec_drmprime,
     &ra_hwdec_drmprime_overlay,
 #endif
-#if HAVE_ANDROID_MEDIA_NDK
+#if HAVE_ANDROID_GL_HWDEC
     &ra_hwdec_aimagereader,
+    &ra_hwdec_surfacetexture,
 #endif
 #if HAVE_VULKAN
     &ra_hwdec_vulkan,

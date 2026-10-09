@@ -1410,9 +1410,22 @@ android_media_ndk = get_option('android-media-ndk').require(
     features['android'] and cc.has_header_symbol('media/NdkImageReader.h', 'AIMAGE_FORMAT_PRIVATE')
 )
 features += {'android-media-ndk': android_media_ndk.allowed()}
-if features['android-media-ndk']
-    # header only, library is dynamically loaded
-    sources += files('video/out/hwdec/hwdec_aimagereader.c')
+
+# Android GL hwdec importers (AImageReader, SurfaceTexture): both mappers run
+# on an app EGL/GLES context and call eglGetCurrentContext/ra_gl_* directly,
+# so source inclusion AND the hwdec.c registration must be gated on the actual
+# GL + EGL stack plus the media NDK, not on the platform being android alone.
+# NOTE: a default Android build has features['egl'] == false while
+# features['egl-android'] == true (the platform EGL library is found as a
+# library, not via the egl dependency), so egl-android is the EGL fact this
+# gate must use; plain features['egl'] would wrongly disable the importers
+# there. Kept after both dependency blocks so every input feature is already
+# decided.
+features += {'android-gl-hwdec': features['egl-android'] and features['android-media-ndk'] and features['gl']}
+if features['android-gl-hwdec']
+    # media NDK usage is header/dlopen-only here, no link-time dependency
+    sources += files('video/out/hwdec/hwdec_aimagereader.c',
+                     'video/out/hwdec/hwdec_surfacetexture.c')
 endif
 
 d3d_hwaccel = get_option('d3d-hwaccel').require(
