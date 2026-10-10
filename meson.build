@@ -272,6 +272,18 @@ sources = files(
 # compiler stuff
 cc = meson.get_compiler('c')
 
+# Optional fork API: check both its declaration and the linked implementation.
+# Upstream FFmpeg and older prefixes retain the existing MP4 open behavior.
+features += {'lavf-initial-dovi-hvcc': cc.links('''
+    #include <libavformat/avformat.h>
+    int main(void) {
+        int (*complete)(AVFormatContext *, int64_t, int) =
+            avformat_complete_initial_dovi_hvcc;
+        return complete((AVFormatContext *)0, 8 * 1024 * 1024, 64);
+    }
+''', dependencies: [libavformat, libavcodec, libavutil],
+     name: 'avformat initial Dolby Vision hvcC completion')}
+
 flags = ['-D_FILE_OFFSET_BITS=64']
 flags_c = []
 link_flags = []

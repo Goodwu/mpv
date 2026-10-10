@@ -1106,6 +1106,21 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
 
     priv->avfc = avfc;
 
+#if HAVE_LAVF_INITIAL_DOVI_HVCC
+    // MP4 normally has enough container metadata to skip find_stream_info().
+    // Complete missing initial P5 parameter sets without opening a decoder.
+    // Explicit probe choices and callers forbidding probing keep their meaning.
+    if (lavfdopts->probeinfo == -1 && priv->format_hack.skipinfo &&
+        matches_avinputformat_name(priv, "mp4") &&
+        !(demuxer->params && demuxer->params->skip_lavf_probing)) {
+        int r = avformat_complete_initial_dovi_hvcc(avfc, 8 * 1024 * 1024, 64);
+        if (r < 0) {
+            MP_WARN(demuxer, "Initial Dolby Vision parameter sets unavailable: %s\n",
+                    av_err2str(r));
+        }
+    }
+#endif
+
     bool probeinfo = lavfdopts->probeinfo != 0;
     switch (lavfdopts->probeinfo) {
     case -2: probeinfo = priv->avfc->nb_streams == 0; break;
