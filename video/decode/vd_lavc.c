@@ -437,6 +437,30 @@ static void add_all_hwdec_methods(struct hwdec_info **infos, int *num_infos)
             snprintf(info.method_name, sizeof(info.method_name), "%s", wrapper);
             add_hwdec_item(infos, num_infos, info);
         }
+
+        // media-kit PoC: opt-in direct method for the SurfaceTexture importer.
+        // Note: this FFmpeg's mediacodec wrapper declares HW_DEVICE_CTX
+        // configs, so the block above (and its mediacodec-copy entry) is not
+        // reached for it; the hwdec=surfacetexture method must be registered
+        // regardless. Plain --hwdec=auto can still reach this entry (unlisted
+        // methods are just tried last); the actual guard is the probe gate
+        // inside the surfacetexture ra_hwdec driver, and under
+        // vo=mediacodec_embed the AUTO-marked "mediacodec" method resolves
+        // the same device first anyway. Target behavior: an explicit
+        // hwdec=surfacetexture request hits select_and_set_hwdec, and the
+        // non-copying device lookup in hwdec_create_dev resolves the device
+        // registered by the ra_hwdec driver via
+        // hwdec_devices_get_by_imgfmt_and_type(IMGFMT_MEDIACODEC, MEDIACODEC).
+        if (wrapper && strcmp(wrapper, "mediacodec") == 0) {
+            struct hwdec_info info = info_template;
+            info.copying = false;
+            info.lavc_device = AV_HWDEVICE_TYPE_MEDIACODEC;
+            info.pix_fmt = AV_PIX_FMT_MEDIACODEC;
+            info.use_hw_frames = false;
+            info.use_hw_device = true;
+            snprintf(info.method_name, sizeof(info.method_name), "surfacetexture");
+            add_hwdec_item(infos, num_infos, info);
+        }
     }
 
     qsort(*infos, *num_infos, sizeof(struct hwdec_info), hwdec_compare);
