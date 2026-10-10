@@ -398,6 +398,14 @@ static bool display_init(struct ra_ctx *ctx)
     }
 
 #if HAVE_DRM
+        PFN_vkGetPhysicalDeviceProperties2 get_properties2 =
+            (PFN_vkGetPhysicalDeviceProperties2) mpvk_get_physical_device_proc_addr(
+                vk->vkinst, "vkGetPhysicalDeviceProperties2",
+                "vkGetPhysicalDeviceProperties2KHR");
+        if (!get_properties2) {
+            MP_MSG(ctx, msgl, "Vulkan DRM setup requires physical device properties2 support.\n");
+            goto error;
+        }
         VkPhysicalDevicePCIBusInfoPropertiesEXT pci_props = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT,
         };
@@ -405,7 +413,7 @@ static bool display_init(struct ra_ctx *ctx)
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2_KHR,
             .pNext = &pci_props,
         };
-        vkGetPhysicalDeviceProperties2(device, &props);
+        get_properties2(device, &props);
 
         if (!drm_setup(ctx, display_idx, &pci_props))
             MP_WARN(ctx, "Failed to set up DRM.\n");

@@ -76,7 +76,16 @@ static int vulkan_init(struct ra_hwdec *hw)
     uint32_t num_qf = 0;
     VkQueueFamilyProperties2 *qf = NULL;
     VkQueueFamilyVideoPropertiesKHR *qf_vid = NULL;
-    vkGetPhysicalDeviceQueueFamilyProperties2(vk->vulkan->phys_device, &num_qf, NULL);
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties2 get_queue_properties2 =
+        (PFN_vkGetPhysicalDeviceQueueFamilyProperties2)
+            mpvk_get_physical_device_proc_addr(
+                vk->vkinst, "vkGetPhysicalDeviceQueueFamilyProperties2",
+                "vkGetPhysicalDeviceQueueFamilyProperties2KHR");
+    if (!get_queue_properties2) {
+        MP_MSG(hw, level, "Vulkan hwdec requires queue family properties2 support.\n");
+        goto error;
+    }
+    get_queue_properties2(vk->vulkan->phys_device, &num_qf, NULL);
     if (!num_qf)
         goto error;
 
@@ -92,7 +101,7 @@ static int vulkan_init(struct ra_hwdec *hw)
         };
     }
 
-    vkGetPhysicalDeviceQueueFamilyProperties2(vk->vulkan->phys_device, &num_qf, qf);
+    get_queue_properties2(vk->vulkan->phys_device, &num_qf, qf);
 
     hw_device_ctx = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_VULKAN);
     if (!hw_device_ctx)
