@@ -15,18 +15,42 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <errno.h>
+#include <string.h>
+#include <time.h>
+
 #include <libavcodec/mediacodec.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_mediacodec.h>
 
 #include "common/common.h"
+#include "options/m_config.h"
+#include "options/m_option.h"
 #include "vo.h"
 #include "video/mp_image.h"
 #include "video/hwdec.h"
 
+struct mediacodec_embed_opts {
+    int render_mode;
+};
+
+#define OPT_BASE_STRUCT struct mediacodec_embed_opts
+static const struct m_sub_options mediacodec_embed_conf = {
+    .prefix = "mediacodec-embed",
+    .opts = (const struct m_option[]) {
+        {"render-mode", OPT_CHOICE(render_mode, {"boolean", 0}, {"timed", 1})},
+        {0}
+    },
+    .size = sizeof(struct mediacodec_embed_opts),
+    .defaults = &(const struct mediacodec_embed_opts){ .render_mode = 0 },
+};
+#undef OPT_BASE_STRUCT
+
 struct priv {
     struct mp_image *next_image;
     struct mp_hwdec_ctx hwctx;
+    struct m_config_cache *opts_cache;
+    struct mediacodec_embed_opts *opts;
 };
 
 static AVBufferRef *create_mediacodec_device_ref(struct vo *vo)
@@ -49,6 +73,10 @@ static AVBufferRef *create_mediacodec_device_ref(struct vo *vo)
 static int preinit(struct vo *vo)
 {
     struct priv *p = vo->priv;
+    p->opts_cache = m_config_cache_alloc(vo, vo->global, &mediacodec_embed_conf);
+    p->opts = p->opts_cache->opts;
+    MP_VERBOSE(vo, "MediaCodec Surface render mode: %s\n",
+               p->opts->render_mode ? "timed" : "boolean");
     vo->hwdec_devs = hwdec_devices_create();
     p->hwctx = (struct mp_hwdec_ctx){
         .driver_name = "mediacodec_embed",
@@ -72,7 +100,34 @@ static void flip_page(struct vo *vo)
         return;
 
     AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)p->next_image->planes[3];
-    av_mediacodec_release_buffer(buffer, 1);
+    if (m_config_cache_update(p->opts_cache))
+        MP_VERBOSE(vo, "MediaCodec Surface render mode changed: %s\n",
+                   p->opts->render_mode ? "timed" : "boolean");
+
+    if (p->opts->render_mode) {
+        struct timespec now;
+        // Android renders at renderTimestampNs in the SystemClock
+        // elapsedRealtimeNanos() time base, which includes suspend and matches
+        // CLOCK_BOOTTIME, not CLOCK_MONOTONIC; a monotonic timestamp would
+        // land in the past by the accumulated suspend time.
+        if (clock_gettime(CLOCK_BOOTTIME, &now) == 0) {
+            int64_t time_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
+            int ret = av_mediacodec_render_buffer_at_time(buffer, time_ns);
+            if (ret < 0)
+                MP_ERR(vo, "Timed MediaCodec release failed: %d; no retry\n", ret);
+        } else {
+            int clock_error = errno;
+            MP_WARN(vo, "CLOCK_BOOTTIME read failed (%s); using boolean release once\n",
+                    strerror(clock_error));
+            int ret = av_mediacodec_release_buffer(buffer, 1);
+            if (ret < 0)
+                MP_ERR(vo, "MediaCodec boolean release after clock failure failed: %d; no retry\n", ret);
+        }
+    } else {
+        int ret = av_mediacodec_release_buffer(buffer, 1);
+        if (ret < 0)
+            MP_ERR(vo, "MediaCodec boolean release failed: %d; no retry\n", ret);
+    }
     mp_image_unrefp(&p->next_image);
 }
 
@@ -125,4 +180,5 @@ const struct vo_driver video_out_mediacodec_embed = {
     .reconfig = reconfig,
     .uninit = uninit,
     .priv_size = sizeof(struct priv),
+    .global_opts = &mediacodec_embed_conf,
 };
