@@ -2313,6 +2313,37 @@ static int mp_property_current_tracks(void *ctx, struct m_property *prop,
     return mp_property_do(name, ka->action, ka->arg, ctx);
 }
 
+static int mp_property_android_native_dv_api(void *ctx, struct m_property *prop,
+                                             int action, void *arg)
+{
+    const AVCodec *codec = avcodec_find_decoder_by_name("hevc_mediacodec");
+    return m_property_int_ro(action, arg, mp_avcodec_native_dv_api(codec));
+}
+
+static int mp_property_android_mediacodec_info(void *ctx, struct m_property *prop,
+                                              int action, void *arg)
+{
+    if (action == M_PROPERTY_GET_TYPE) {
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
+        return M_PROPERTY_OK;
+    }
+    if (action != M_PROPERTY_GET)
+        return M_PROPERTY_NOT_IMPLEMENTED;
+
+    MPContext *mpctx = ctx;
+    struct track *track = mpctx->current_track[0][STREAM_VIDEO];
+    struct mp_decoder_wrapper *dec = track ? track->dec : NULL;
+    struct mpv_node info = {0};
+    if (!dec || mp_decoder_wrapper_control(dec, VDCTRL_GET_MEDIACODEC_INFO,
+                                           &info) <= 0) {
+        // No previous successful map is cached or reused.
+        talloc_free(info.u.list);
+        return M_PROPERTY_UNAVAILABLE;
+    }
+    *(struct mpv_node *)arg = info;
+    return M_PROPERTY_OK;
+}
+
 static int mp_property_hwdec_current(void *ctx, struct m_property *prop,
                                      int action, void *arg)
 {
@@ -4527,6 +4558,8 @@ static const struct m_property mp_properties_base[] = {
     {"video-aspect-override", mp_property_video_aspect_override},
     {"vid", mp_property_switch_track, .priv = (void *)(const int[]){0, STREAM_VIDEO}},
     {"hwdec-current", mp_property_hwdec_current},
+    {"android-native-dv-bridge-api", mp_property_android_native_dv_api},
+    {"android-mediacodec-info", mp_property_android_mediacodec_info},
     {"hwdec-interop", mp_property_hwdec_interop},
 
     {"estimated-frame-count", mp_property_frame_count},
@@ -4645,7 +4678,7 @@ static const char *const *const mp_event_property_change[] = {
     E(MPV_EVENT_FILE_LOADED, "*"),
     E(MP_EVENT_CHANGE_ALL, "*"),
     E(MP_EVENT_TRACKS_CHANGED, "track-list", "current-tracks"),
-    E(MP_EVENT_TRACK_SWITCHED, "track-list", "current-tracks"),
+    E(MP_EVENT_TRACK_SWITCHED, "track-list", "current-tracks", "android-mediacodec-info"),
     E(MPV_EVENT_IDLE, "*"),
     E(MPV_EVENT_TICK, "time-pos", "audio-pts", "stream-pos", "avsync",
       "percent-pos", "time-remaining", "playtime-remaining", "playback-time",
@@ -4662,7 +4695,7 @@ static const char *const *const mp_event_property_change[] = {
       "video-format", "video-codec", "video-bitrate", "dwidth", "dheight",
       "width", "height", "container-fps", "aspect", "aspect-name", "vo-configured", "current-vo",
       "video-dec-params", "osd-dimensions", "hwdec", "hwdec-current", "hwdec-interop",
-      "window-id", "track-list", "current-tracks"),
+      "window-id", "track-list", "current-tracks", "android-mediacodec-info"),
     E(MPV_EVENT_AUDIO_RECONFIG, "audio-format", "audio-codec", "audio-bitrate",
       "samplerate", "channels", "audio", "volume", "volume-gain", "mute",
       "current-ao", "audio-codec-name", "audio-params", "track-list", "current-tracks",

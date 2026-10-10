@@ -35,6 +35,8 @@
 #include "options/options.h"
 #include "osdep/threads.h"
 #include "misc/bstr.h"
+#include "misc/node.h"
+#include <mpv/client.h>
 #include "common/av_common.h"
 #include "common/codecs.h"
 
@@ -1359,6 +1361,49 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
     return 0;
 }
 
+static int get_mediacodec_info(vd_ffmpeg_ctx *ctx, struct mpv_node *out)
+{
+    AVCodecContext *avctx = ctx->avctx;
+    const AVCodec *codec = avctx ? avctx->codec : NULL;
+    if (!avctx || !avcodec_is_open(avctx) || !avctx->priv_data || !codec ||
+        codec->type != AVMEDIA_TYPE_VIDEO || !codec->wrapper_name ||
+        strcmp(codec->wrapper_name, "mediacodec") ||
+        mp_avcodec_native_dv_api(codec) != 1)
+        return CONTROL_FALSE;
+
+    int64_t api = 0;
+    int64_t active = 0;
+    uint8_t *mime = NULL;
+    uint8_t *name = NULL;
+    int ret = CONTROL_FALSE;
+    // A strict whitelist: never expose arbitrary private AVOptions. The
+    // wrapper's decoder dispatch lock protects all reads and string copies.
+    if (av_opt_get_int(avctx->priv_data, "native_dv_api_version", 0, &api) < 0 ||
+        api != 1 ||
+        av_opt_get_int(avctx->priv_data, "native_dv_active", 0, &active) < 0 ||
+        (active != 0 && active != 1) ||
+        av_opt_get(avctx->priv_data, "mediacodec_mime", AV_OPT_ALLOW_NULL, &mime) < 0 ||
+        av_opt_get(avctx->priv_data, "mediacodec_name", AV_OPT_ALLOW_NULL, &name) < 0 ||
+        !mime || !mime[0] || !name ||
+        (active && strcmp((char *)mime, "video/dolby-vision")))
+        goto done;
+
+    // Empty codec name is allowed: FFmpeg explicitly reports unknown names
+    // this way. node_map_add_string makes its own copy before av_free().
+    struct mpv_node info;
+    node_init(&info, MPV_FORMAT_NODE_MAP, NULL);
+    node_map_add_int64(&info, "api", api);
+    node_map_add_string(&info, "mime", (char *)mime);
+    node_map_add_string(&info, "codec", (char *)name);
+    node_map_add_flag(&info, "native-dv-active", active == 1);
+    *out = info;
+    ret = CONTROL_TRUE;
+done:
+    av_free(mime);
+    av_free(name);
+    return ret;
+}
+
 static int control(struct mp_filter *vd, enum dec_ctrl cmd, void *arg)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
@@ -1377,6 +1422,8 @@ static int control(struct mp_filter *vd, enum dec_ctrl cmd, void *arg)
         *(int *)arg = avctx->has_b_frames;
         return CONTROL_TRUE;
     }
+    case VDCTRL_GET_MEDIACODEC_INFO:
+        return get_mediacodec_info(ctx, arg);
     case VDCTRL_GET_HWDEC: {
         if (!ctx->hwdec_notified)
             return CONTROL_FALSE;

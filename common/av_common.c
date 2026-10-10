@@ -40,6 +40,41 @@
 #include "av_common.h"
 #include "codecs.h"
 
+// The runtime fields are READONLY, so av_opt_set_defaults() does not initialize
+// them. Static capability uses the version descriptor, never a fresh instance.
+int mp_avcodec_native_dv_api(const AVCodec *codec)
+{
+    if (!codec || !codec->priv_class)
+        return 0;
+    const AVClass *priv_class = codec->priv_class;
+    const AVOption *request = av_opt_find(&priv_class, "native_dv", NULL, 0,
+                                         AV_OPT_SEARCH_FAKE_OBJ);
+    if (!request || request->type != AV_OPT_TYPE_BOOL || request->offset <= 0 ||
+        (request->flags & AV_OPT_FLAG_READONLY))
+        return 0;
+
+    const struct {
+        const char *name;
+        enum AVOptionType type;
+    } fields[] = {
+        {"native_dv_api_version", AV_OPT_TYPE_INT},
+        {"mediacodec_mime", AV_OPT_TYPE_STRING},
+        {"mediacodec_name", AV_OPT_TYPE_STRING},
+        {"native_dv_active", AV_OPT_TYPE_INT},
+    };
+    int flags = AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY;
+    for (int n = 0; n < MP_ARRAY_SIZE(fields); n++) {
+        const AVOption *opt = av_opt_find(&priv_class, fields[n].name, NULL, 0,
+                                         AV_OPT_SEARCH_FAKE_OBJ);
+        if (!opt || opt->type != fields[n].type || opt->offset <= 0 ||
+            (opt->flags & flags) != flags)
+            return 0;
+        if (n == 0 && opt->default_val.i64 != 1)
+            return 0;
+    }
+    return 1;
+}
+
 enum AVMediaType mp_to_av_stream_type(int type)
 {
     switch (type) {

@@ -75,6 +75,10 @@ enum dec_ctrl {
     // framedrop mode: 0=none, 1=standard, 2=hrseek
     VDCTRL_SET_FRAMEDROP,
     VDCTRL_CHECK_FORCED_EOF,
+    // Append controls to preserve values used by existing compiled consumers.
+    // arg: fresh mpv_node*, receives an independently owned map on success.
+    // Configuration facts only; does not establish visible/HDR presentation.
+    VDCTRL_GET_MEDIACODEC_INFO,
 };
 
 int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,
