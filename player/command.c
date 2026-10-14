@@ -2545,6 +2545,10 @@ static int property_imgparams(const struct mp_image_params *p, int action, void 
         // no such side data; the whole video-params property (including this
         // entry) is unavailable before the first decoded frame.
         {"hdr-vivid",   SUB_PROP_BOOL(p->hdr_vivid)},
+        // Per-frame HDR10+ side-data presence before format/mapping filters.
+        // A true value does not certify Bezier/OOTF consumption or HDR10+
+        // signaling to the display.
+        {"hdr10-plus",  SUB_PROP_BOOL(p->hdr10_plus)},
         {"max-pq-y",    SUB_PROP_FLOAT(hdr->max_pq_y),     .unavailable = !has_cie_y},
         {"avg-pq-y",    SUB_PROP_FLOAT(hdr->avg_pq_y),     .unavailable = !has_cie_y},
         {"prim-red-x",   SUB_PROP_FLOAT(hdr->prim.red.x),  .unavailable = !custom_prim },

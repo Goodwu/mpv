@@ -61,6 +61,11 @@ struct mp_image_params {
     // of presence is tracked; the metadata itself is not mapped. Per-frame
     // dynamic state: excluded from mp_image_params_static_equal().
     bool hdr_vivid;
+    // The decoded frame carried AV_FRAME_DATA_DYNAMIC_HDR_PLUS. This is
+    // presence evidence only: it does not prove a mapping curve was applied
+    // or that a native HDR10+ display received the metadata. Like Vivid,
+    // dynamic state is excluded from mp_image_params_static_equal().
+    bool hdr10_plus;
 
     enum mp_csp_light light;
     enum pl_chroma_location chroma_location;

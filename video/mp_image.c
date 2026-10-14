@@ -870,6 +870,7 @@ bool mp_image_params_equal(const struct mp_image_params *p1,
            p1->force_window == p2->force_window &&
            p1->dv_profile == p2->dv_profile &&
            p1->hdr_vivid == p2->hdr_vivid &&
+           p1->hdr10_plus == p2->hdr10_plus &&
            pl_color_space_equal(&p1->color, &p2->color) &&
            pl_color_repr_equal(&p1->repr, &p2->repr) &&
            p1->light == p2->light &&
@@ -889,6 +890,7 @@ bool mp_image_params_static_equal(const struct mp_image_params *p1,
     a.repr.dovi = b.repr.dovi = NULL;
     a.color.hdr = b.color.hdr = (struct pl_hdr_metadata){0};
     a.hdr_vivid = b.hdr_vivid = false;
+    a.hdr10_plus = b.hdr10_plus = false;
     return mp_image_params_equal(&a, &b);
 }
 
@@ -898,6 +900,7 @@ void mp_image_params_update_dynamic(struct mp_image_params *dst,
 {
     dst->repr.dovi = src->repr.dovi;
     dst->hdr_vivid = src->hdr_vivid;
+    dst->hdr10_plus = src->hdr10_plus;
     // Don't overwrite peak-detected HDR metadata if available.
     float max_pq_y = dst->color.hdr.max_pq_y;
     float avg_pq_y = dst->color.hdr.avg_pq_y;
@@ -1171,6 +1174,9 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
     AVFrameSideData *mdm = av_frame_get_side_data(src, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
     AVFrameSideData *clm = av_frame_get_side_data(src, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
     AVFrameSideData *dhp = av_frame_get_side_data(src, AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
+    // Source fact before the libplacebo conversion: later processing may
+    // reject the metadata form, so scene statistics are not a presence test.
+    dst->params.hdr10_plus = !!(dhp && dhp->buf && dhp->size);
     pl_map_hdr_metadata(&dst->params.color.hdr, &(struct pl_av_hdr_metadata) {
         .mdm = (void *)(mdm ? mdm->data : NULL),
         .clm = (void *)(clm ? clm->data : NULL),
