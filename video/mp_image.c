@@ -555,6 +555,10 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
     dst->params.light = src->params.light;
     dst->params.chroma_location = src->params.chroma_location;
     dst->params.crop = src->params.crop;
+    // Per-frame presence facts must survive attribute copies (e.g. the
+    // hw->sw download after hwdec=mediacodec-copy), or the video-params
+    // property loses them although the decoded frame carried the side data.
+    dst->params.hdr10_plus = src->params.hdr10_plus;
     dst->nominal_fps = src->nominal_fps;
     dst->params.primaries_orig = src->params.primaries_orig;
     dst->params.transfer_orig = src->params.transfer_orig;

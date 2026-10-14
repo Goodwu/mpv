@@ -61,6 +61,9 @@
 static void init_avctx(struct mp_filter *vd);
 static void uninit_avctx(struct mp_filter *vd);
 
+struct lavc_ctx;
+static void clear_hdr10plus_pkts(struct lavc_ctx *ctx);
+
 static int get_buffer2_direct(AVCodecContext *avctx, AVFrame *pic, int flags);
 static enum AVPixelFormat get_format_hwdec(struct AVCodecContext *avctx,
                                            const enum AVPixelFormat *pix_fmt);
@@ -250,8 +253,25 @@ typedef struct lavc_ctx {
     struct mp_image_pool *dr_pool;
     int dr_imgfmt, dr_w, dr_h, dr_stride_align;
 
+    // HDR10+ packet side data in flight, keyed by pts (codec_timebase). Some
+    // hardware decoders (mediacodec surface output wraps frames without
+    // ff_decode_frame_props()) drop AV_PKT_DATA_DYNAMIC_HDR10_PLUS instead of
+    // propagating it to output frames; the decoder hook re-attaches the
+    // demuxer-exported bytes to the matching frame. Never fabricates data:
+    // entries exist only for packets that actually carried the side data.
+    struct vd_lavc_hdr10plus_pkt {
+        int64_t pts;
+        uint8_t *data;
+        size_t size;
+    } *hdr10plus_pkts;
+    int num_hdr10plus_pkts;
+
     struct mp_decoder public;
 } vd_ffmpeg_ctx;
+
+// Bound on in-flight entries. MediaCodec pipelines a handful of access units;
+// this covers deep reorder plus slack, and bounds memory (~0.5 kB/entry).
+#define HDR10PLUS_PKT_QUEUE_MAX 128
 
 enum {
     HWDEC_FLAG_AUTO         = (1 << 0), // prioritize in autoprobe order
@@ -926,6 +946,8 @@ static void flush_all(struct mp_filter *vd)
         talloc_free(ctx->requeue_packets[n]);
     ctx->num_requeue_packets = 0;
 
+    clear_hdr10plus_pkts(ctx);
+
     reset_avctx(vd);
 }
 
@@ -1190,6 +1212,73 @@ static void handle_err(struct mp_filter *vd)
     }
 }
 
+static void clear_hdr10plus_pkts(vd_ffmpeg_ctx *ctx)
+{
+    for (int n = 0; n < ctx->num_hdr10plus_pkts; n++)
+        talloc_free(ctx->hdr10plus_pkts[n].data);
+    ctx->num_hdr10plus_pkts = 0;
+}
+
+// Stash the packet's HDR10+ side data for re-attachment at output. Call only
+// after avcodec_send_packet() consumed the packet, so requeue cannot
+// double-track.
+static void track_hdr10plus_packet(struct mp_filter *vd, const AVPacket *pkt)
+{
+    vd_ffmpeg_ctx *ctx = vd->priv;
+
+    if (pkt->pts == AV_NOPTS_VALUE)
+        return;
+    size_t size = 0;
+    const uint8_t *data = av_packet_get_side_data(
+        pkt, AV_PKT_DATA_DYNAMIC_HDR10_PLUS, &size);
+    if (!data || !size)
+        return;
+    if (ctx->num_hdr10plus_pkts == HDR10PLUS_PKT_QUEUE_MAX) {
+        talloc_free(ctx->hdr10plus_pkts[0].data);
+        MP_TARRAY_REMOVE_AT(ctx->hdr10plus_pkts, ctx->num_hdr10plus_pkts, 0);
+    }
+    struct vd_lavc_hdr10plus_pkt e = {
+        .pts = pkt->pts,
+        .size = size,
+        .data = talloc_size(ctx, size),
+    };
+    if (!e.data)
+        return;
+    memcpy(e.data, data, size);
+    MP_TARRAY_APPEND(ctx, ctx->hdr10plus_pkts, ctx->num_hdr10plus_pkts, e);
+}
+
+// Gap filler for decoders that drop packet side data on their output frames
+// (mediacodec surface output never runs ff_decode_frame_props()). The frame
+// keeps decoder-attached side data if the decoder did propagate it.
+static void attach_stashed_hdr10plus(struct mp_filter *vd, AVFrame *frame)
+{
+    vd_ffmpeg_ctx *ctx = vd->priv;
+
+    if (!ctx->num_hdr10plus_pkts)
+        return;
+    for (int n = 0; n < ctx->num_hdr10plus_pkts; n++) {
+        struct vd_lavc_hdr10plus_pkt *e = &ctx->hdr10plus_pkts[n];
+        if (frame->pts == AV_NOPTS_VALUE)
+            break;
+        // The decoder round-trips pts through microseconds (MediaCodec
+        // presentationTimeUs), which may shift it by a single timebase tick.
+        int64_t diff = e->pts > frame->pts ? e->pts - frame->pts
+                                           : frame->pts - e->pts;
+        if (diff > 1)
+            continue;
+        if (!av_frame_get_side_data(frame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS)) {
+            AVFrameSideData *sd = av_frame_new_side_data(
+                frame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS, e->size);
+            if (sd)
+                memcpy(sd->data, e->data, e->size);
+        }
+        talloc_free(e->data);
+        MP_TARRAY_REMOVE_AT(ctx->hdr10plus_pkts, ctx->num_hdr10plus_pkts, n);
+        return;
+    }
+}
+
 static int send_packet(struct mp_filter *vd, struct demux_packet *pkt)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
@@ -1214,6 +1303,9 @@ static int send_packet(struct mp_filter *vd, struct demux_packet *pkt)
     int ret = avcodec_send_packet(avctx, pkt ? ctx->avpkt : NULL);
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
         return ret;
+
+    if (ret >= 0 && pkt)
+        track_hdr10plus_packet(vd, ctx->avpkt);
 
     if (ctx->hw_probing && ctx->num_sent_packets < 32 &&
         ctx->hwdec_opts->software_fallback <= 32)
@@ -1276,6 +1368,8 @@ static int decode_frame(struct mp_filter *vd)
     // If something was decoded successfully, it must return a frame with valid
     // data.
     mp_assert(ctx->pic->buf[0]);
+
+    attach_stashed_hdr10plus(vd, ctx->pic);
 
     struct mp_image *mpi = mp_image_from_av_frame(ctx->pic);
     if (!mpi) {
