@@ -310,14 +310,10 @@ static bool yuv_diag_ensure_offscreen(struct ra_ctx *ctx, int w, int h)
     struct priv *p = ctx->priv;
     struct GL *gl = &p->gl;
     if (w <= 1 || h <= 1) {
-        // (a) fail-closed: a 1x1 (or non-positive) size is a placeholder (it
-        // appears after a failed configure — possibly a RESULT of that
-        // failure rather than its cause; the c1/c2 fixes address the causes).
-        // Do not create the offscreen on a placeholder and do not continue
-        // this round; no global size hardcoding, resize lifecycle untouched.
-        MP_MSG(ctx, MSGL_FATAL, "YUV-DIAG: placeholder size (%dx%d); not "
-               "creating the offscreen, terminating (fail-closed)\n", w, h);
-        return false;
+        // A Surface can bind before its first layout. Keep a valid placeholder
+        // until the normal resize path supplies the real dimensions.
+        w = MPMAX(w, 1);
+        h = MPMAX(h, 1);
     }
     if (p->yuv.fbo && p->yuv.w == w && p->yuv.h == h)
         return true;
