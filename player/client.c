@@ -1502,6 +1502,60 @@ char *mpv_get_property_string(mpv_handle *ctx, const char *name)
     return str;
 }
 
+struct get_property_strings_request {
+    struct MPContext *mpctx;
+    const char *const *names;
+    int count;
+    mpv_node *result;
+};
+
+static void get_property_strings_fn(void *arg)
+{
+    struct get_property_strings_request *req = arg;
+    node_init(req->result, MPV_FORMAT_NODE_ARRAY, NULL);
+    for (int n = 0; n < req->count; n++) {
+        char *value = NULL;
+        int err = mp_property_do(req->names[n], M_PROPERTY_GET_STRING,
+                                 &value, req->mpctx);
+        struct mpv_node *item = node_array_add(req->result, MPV_FORMAT_NONE);
+        if (err == M_PROPERTY_OK && value) {
+            item->format = MPV_FORMAT_STRING;
+            item->u.string = talloc_steal(req->result->u.list, value);
+        } else if (value) {
+            talloc_free(value);
+        }
+    }
+}
+
+// media-kit fork extension: read ordered string properties under one core
+// dispatch lock. Unavailable properties are represented by MPV_FORMAT_NONE.
+int mpv_mediakit_get_property_strings(mpv_handle *ctx,
+                                      const char *const *names, int count,
+                                      mpv_node *result)
+{
+    if (!result)
+        return MPV_ERROR_INVALID_PARAMETER;
+    *result = (mpv_node){0};
+    if (!ctx || count < 0 || count > 4096 ||
+        (count > 0 && !names))
+        return MPV_ERROR_INVALID_PARAMETER;
+    for (int n = 0; n < count; n++) {
+        if (!names[n])
+            return MPV_ERROR_INVALID_PARAMETER;
+    }
+    if (!ctx->mpctx->initialized)
+        return MPV_ERROR_UNINITIALIZED;
+
+    struct get_property_strings_request req = {
+        .mpctx = ctx->mpctx,
+        .names = names,
+        .count = count,
+        .result = result,
+    };
+    run_locked(ctx, get_property_strings_fn, &req);
+    return 0;
+}
+
 char *mpv_get_property_osd_string(mpv_handle *ctx, const char *name)
 {
     char *str = NULL;

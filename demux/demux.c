@@ -238,6 +238,8 @@ struct demux_internal {
     bool seeking;               // there's a seek queued
     int seek_flags;             // flags for next seek (if seeking==true)
     double seek_pts;
+    uint64_t seek_generation;   // nonzero; advances when reader/seek state changes
+    uint64_t executing_seek_generation; // fixed token for the active seek callback
 
     // (fields for debugging)
     double seeking_in_progress; // low level seek state
@@ -377,6 +379,9 @@ struct demux_stream {
 
     // demuxer state
     bool selected;          // user wants packets from this stream
+    uint64_t pending_seek_generation;
+    double pending_seek_target; // internal timestamp coordinate
+    bool has_returned_packet;   // persistent: a packet was returned to a reader
     bool eager;             // try to keep at least 1 packet queued
                             // if false, this stream is disabled, or passively
                             // read (like subtitles)
@@ -440,6 +445,12 @@ struct demux_stream {
     struct sh_stream *cc;
     bool ignore_eof;        // ignore stream in underrun detection
 };
+
+static void advance_seek_generation(struct demux_internal *in)
+{
+    if (++in->seek_generation == 0)
+        in->seek_generation = 1;
+}
 
 static void switch_to_fresh_cache_range(struct demux_internal *in);
 static void demuxer_sort_chapters(demuxer_t *demuxer);
@@ -843,6 +854,7 @@ static void ds_clear_reader_state(struct demux_stream *ds,
 static void clear_reader_state(struct demux_internal *in,
                                bool clear_back_state)
 {
+    advance_seek_generation(in);
     for (int n = 0; n < in->num_streams; n++)
         ds_clear_reader_state(in->streams[n]->ds, clear_back_state);
     in->warned_queue_overflow = false;
@@ -927,8 +939,106 @@ void demux_set_ts_offset(struct demuxer *demuxer, double offset)
 {
     struct demux_internal *in = demuxer->in;
     mp_mutex_lock(&in->lock);
+    if (in->ts_offset != offset)
+        advance_seek_generation(in);
     in->ts_offset = offset;
     mp_mutex_unlock(&in->lock);
+}
+
+uint64_t demux_get_active_seek_callback_token(struct demuxer *demuxer)
+{
+    struct demux_internal *in = demuxer->in;
+    mp_mutex_lock(&in->lock);
+    uint64_t token = in->executing_seek_generation;
+    mp_mutex_unlock(&in->lock);
+    return token;
+}
+
+bool demux_publish_pending_seek(struct demuxer *demuxer, uint64_t token,
+                                const int *stream_indices, int num_streams,
+                                double target)
+{
+    struct demux_internal *in = demuxer->in;
+    bool published = false;
+    mp_mutex_lock(&in->lock);
+    if (token && token == in->executing_seek_generation &&
+        token == in->seek_generation && target != MP_NOPTS_VALUE &&
+        isfinite(target))
+    {
+        for (int n = 0; n < num_streams; n++) {
+            int index = stream_indices[n];
+            if (index < 0 || index >= in->num_streams)
+                continue;
+            struct demux_stream *ds = in->streams[index]->ds;
+            if (ds->selected || ds->has_returned_packet)
+                continue;
+            ds->pending_seek_generation = token;
+            ds->pending_seek_target = target;
+            published = true;
+        }
+    }
+    mp_mutex_unlock(&in->lock);
+    return published;
+}
+
+void demux_clear_pending_seek(struct demuxer *demuxer, uint64_t token,
+                              const int *stream_indices, int num_streams)
+{
+    struct demux_internal *in = demuxer->in;
+    mp_mutex_lock(&in->lock);
+    if (token) {
+        for (int n = 0; n < num_streams; n++) {
+            int index = stream_indices[n];
+            if (index < 0 || index >= in->num_streams)
+                continue;
+            struct demux_stream *ds = in->streams[index]->ds;
+            if (ds->pending_seek_generation == token) {
+                ds->pending_seek_generation = 0;
+                ds->pending_seek_target = MP_NOPTS_VALUE;
+            }
+        }
+    }
+    mp_mutex_unlock(&in->lock);
+}
+
+bool demux_startup_prefetch_token_valid(struct demuxer *demuxer,
+                                        uint64_t token)
+{
+    struct demux_internal *in = demuxer->in;
+    mp_mutex_lock(&in->lock);
+    bool valid = token && token == in->seek_generation && !in->seeking &&
+                 !in->back_demuxing;
+    mp_mutex_unlock(&in->lock);
+    return valid;
+}
+
+bool demux_startup_prefetch_has_room(struct demuxer *demuxer, uint64_t token,
+                                     struct demux_packet *packet,
+                                     bool *token_valid)
+{
+    struct demux_internal *in = demuxer->in;
+    mp_mutex_lock(&in->lock);
+    *token_valid = token && token == in->seek_generation && !in->seeking &&
+                   !in->back_demuxing;
+
+    uint64_t total_fw_bytes = 0;
+    for (int n = 0; n < in->num_streams; n++) {
+        uint64_t bytes = get_forward_buffered_bytes(in->streams[n]->ds);
+        if (UINT64_MAX - total_fw_bytes < bytes) {
+            total_fw_bytes = UINT64_MAX;
+            break;
+        }
+        total_fw_bytes += bytes;
+    }
+
+    uint64_t limit = in->max_bytes;
+    bool has_room = total_fw_bytes < limit;
+    if (has_room && packet) {
+        uint64_t packet_bytes = demux_packet_estimate_total_size(packet);
+        has_room = packet_bytes < limit - total_fw_bytes;
+    }
+    mp_mutex_unlock(&in->lock);
+    return has_room;
 }
 
 static void add_missing_streams(struct demux_internal *in,
@@ -984,6 +1094,7 @@ static void demux_add_sh_stream_locked(struct demux_internal *in,
         .sh = sh,
         .type = sh->type,
         .index = sh->index,
+        .pending_seek_target = MP_NOPTS_VALUE,
         .global_correct_dts = true,
         .global_correct_pos = true,
     };
@@ -1810,6 +1921,7 @@ static void attempt_range_joining(struct demux_internal *in)
     update_seek_ranges(current);
 
     // Move demuxing position to after the current range.
+    advance_seek_generation(in);
     in->seeking = true;
     in->seek_flags = SEEK_HR;
     in->seek_pts = next->seek_end - 1.0;
@@ -2435,6 +2547,8 @@ static void execute_seek(struct demux_internal *in)
     in->after_seek_to_start =
         !(flags & (SEEK_FORWARD | SEEK_FACTOR)) &&
         pts <= in->d_thread->start_time;
+    uint64_t callback_generation = in->seek_generation;
+    in->executing_seek_generation = callback_generation;
 
     for (int n = 0; n < in->num_streams; n++)
         in->streams[n]->ds->queue->last_pos_fixup = -1;
@@ -2454,6 +2568,8 @@ static void execute_seek(struct demux_internal *in)
     mp_mutex_lock(&in->lock);
 
     in->seeking_in_progress = MP_NOPTS_VALUE;
+    if (in->executing_seek_generation == callback_generation)
+        in->executing_seek_generation = 0;
 }
 
 static void update_opts(struct demuxer *demuxer)
@@ -2652,6 +2768,7 @@ static int dequeue_packet(struct demux_stream *ds, double min_pts,
                                                      ds->sh->attached_picture);
         MP_HANDLE_OOM(pkt);
         pkt->stream = ds->sh->index;
+        ds->has_returned_packet = true;
         *res = pkt;
         return 1;
     }
@@ -2764,6 +2881,7 @@ static int dequeue_packet(struct demux_stream *ds, double min_pts,
     }
 
     prune_old_packets(in);
+    ds->has_returned_packet = true;
     *res = pkt;
     return 1;
 }
@@ -3323,6 +3441,7 @@ static struct demuxer *open_given_type(struct mpv_global *global,
         .d_user = demuxer,
         .after_seek = true, // (assumed identical to initial demuxer state)
         .after_seek_to_start = true,
+        .seek_generation = 1,
         .highest_av_pts = MP_NOPTS_VALUE,
         .seeking_in_progress = MP_NOPTS_VALUE,
         .demux_ts = MP_NOPTS_VALUE,
@@ -3742,6 +3861,7 @@ static void execute_cache_seek(struct demux_internal *in,
                                struct demux_cached_range *range,
                                double pts, int flags)
 {
+    advance_seek_generation(in);
     adjust_cache_seek_target(in, range, &pts, &flags);
 
     for (int n = 0; n < in->num_streams; n++) {
@@ -3870,6 +3990,7 @@ static bool queue_seek(struct demux_internal *in, double seek_pts, int flags,
     } else {
         switch_to_fresh_cache_range(in);
 
+        advance_seek_generation(in);
         in->seeking = true;
         in->seek_flags = flags;
         in->seek_pts = seek_pts;
@@ -3979,7 +4100,9 @@ static void initiate_refresh_seek(struct demux_internal *in,
         start_ts -= 1.0; // small offset to get correct overlap
     }
 
-    MP_VERBOSE(in, "refresh seek to %f\n", start_ts);
+    MP_VERBOSE(in, "MK_STARTUP_NATIVE refresh_seek target=%.6f stream=%d\n",
+               start_ts, stream->index);
+    advance_seek_generation(in);
     in->seeking = true;
     in->seek_flags = SEEK_HR;
     in->seek_pts = start_ts;
@@ -4012,6 +4135,15 @@ static void refresh_track(struct demux_internal *in, struct sh_stream *stream,
     // - If cache is enabled and a seek causes some new data to be cached, the demuxer
     //   is sought to the end of cache after cache joining. Switching track immediately
     //   after this also causes the same problem.
+    // A top-level refresh seek on an EDL timeline re-seeks the master video
+    // source too. The timeline aligns its sources at its own seek, so the
+    // refresh would drag playback back a GOP instead of repositioning one
+    // stream.
+    if (in->d_thread->is_timeline && !ds->has_returned_packet) {
+        MP_VERBOSE(in, "MK_STARTUP_NATIVE refresh_skip_timeline stream=%d\n",
+                   stream->index);
+        return;
+    }
     if (!in->after_seek || (ds->type != STREAM_VIDEO && !avoid_refresh)) {
         MP_VERBOSE(in, "refresh track %d (%s)\n", stream->index,
                    stream_type_name(ds->type));
@@ -4030,11 +4162,47 @@ void demuxer_select_track(struct demuxer *demuxer, struct sh_stream *stream,
     mp_mutex_lock(&in->lock);
     // don't flush buffers if stream is already selected / unselected
     if (ds->selected != selected) {
+        bool use_pending_seek = false;
+        int proof_reason = 1;
+        uint64_t proof_generation = ds->pending_seek_generation;
+        double proof_target = ds->pending_seek_target;
+        double internal_ref_pts = MP_ADD_PTS(ref_pts, -in->ts_offset);
+        if (selected && proof_generation) {
+            if (proof_generation != in->seek_generation)
+                proof_reason = 2;
+            else if (in->seeking)
+                proof_reason = 3;
+            else if (in->back_demuxing)
+                proof_reason = 4;
+            else if (ds->has_returned_packet)
+                proof_reason = 5;
+            else if (ref_pts == MP_NOPTS_VALUE || !isfinite(ref_pts) ||
+                     !isfinite(internal_ref_pts) || !isfinite(proof_target))
+                proof_reason = 6;
+            else if (internal_ref_pts != proof_target)
+                proof_reason = 7;
+            else {
+                proof_reason = 0;
+                use_pending_seek = true;
+            }
+        }
+        if (proof_generation) {
+            MP_VERBOSE(in, "MK_STARTUP_NATIVE pending_proof_select stream=%d type=%d use=%d"
+                       " reason=%d proof_gen=%" PRIu64 " current_gen=%" PRIu64
+                       " seeking=%d backward=%d returned=%d ref=%.9f target=%.9f\n",
+                       ds->index, ds->type, use_pending_seek, proof_reason,
+                       proof_generation, in->seek_generation, in->seeking,
+                       in->back_demuxing, ds->has_returned_packet,
+                       internal_ref_pts, proof_target);
+        }
+        ds->pending_seek_generation = 0;
+        ds->pending_seek_target = MP_NOPTS_VALUE;
+
         MP_VERBOSE(in, "%sselect track %d\n", selected ? "" : "de", stream->index);
         ds->selected = selected;
         update_stream_selection_state(in, ds);
         in->tracks_switched = true;
-        if (ds->selected)
+        if (ds->selected && !use_pending_seek)
             refresh_track(in, stream, ref_pts);
         if (in->threading) {
             mp_cond_signal(&in->wakeup);

@@ -226,6 +226,9 @@ typedef struct demuxer {
     int64_t filesize;
     char *filename;  // same as stream->url
     bool seekable;
+    // Fork: set for EDL/timeline demuxers. Top-level refresh seeks drag all
+    // timeline sources together, so track-switch refreshes are skipped there.
+    bool is_timeline;
     bool partially_seekable; // true if _maybe_ seekable; implies seekable=true
     double start_time;
     double duration;  // -1 if unknown
@@ -323,6 +326,17 @@ bool demux_cancel_test(struct demuxer *demuxer);
 void demux_flush(struct demuxer *demuxer);
 int demux_seek(struct demuxer *demuxer, double rel_seek_secs, int flags);
 void demux_set_ts_offset(struct demuxer *demuxer, double offset);
+uint64_t demux_get_active_seek_callback_token(struct demuxer *demuxer);
+bool demux_publish_pending_seek(struct demuxer *demuxer, uint64_t token,
+                                const int *stream_indices, int num_streams,
+                                double target);
+void demux_clear_pending_seek(struct demuxer *demuxer, uint64_t token,
+                              const int *stream_indices, int num_streams);
+bool demux_startup_prefetch_token_valid(struct demuxer *demuxer,
+                                        uint64_t token);
+bool demux_startup_prefetch_has_room(struct demuxer *demuxer, uint64_t token,
+                                    struct demux_packet *packet,
+                                    bool *token_valid);
 
 void demux_get_bitrate_stats(struct demuxer *demuxer, double *rates);
 void demux_get_reader_state(struct demuxer *demuxer, struct demux_reader_state *r);

@@ -1146,6 +1146,24 @@ MPV_EXPORT int mpv_get_property(mpv_handle *ctx, const char *name, mpv_format fo
 MPV_EXPORT char *mpv_get_property_string(mpv_handle *ctx, const char *name);
 
 /**
+ * media-kit fork extension: read multiple string properties in input order
+ * while acquiring the playback core dispatch lock only once.
+ *
+ * Each unavailable or non-string-convertible property is represented by an
+ * MPV_FORMAT_NONE element in result. On success result is an
+ * MPV_FORMAT_NODE_ARRAY with exactly count entries; release its contents
+ * with mpv_free_node_contents(). count may be zero and may not exceed 4096.
+ * The caller must supply an empty result node. If result is non-NULL, it is
+ * initialized to MPV_FORMAT_NONE even when the call fails.
+ *
+ * @return 0 on success, or a negative MPV_ERROR_* value.
+ */
+MPV_EXPORT int mpv_mediakit_get_property_strings(mpv_handle *ctx,
+                                                  const char *const *names,
+                                                  int count,
+                                                  mpv_node *result);
+
+/**
  * Return the property as "OSD" formatted string. This is the same as
  * mpv_get_property_string, but using MPV_FORMAT_OSD_STRING.
  *

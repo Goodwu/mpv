@@ -834,6 +834,35 @@ static int mp_property_time_start(void *ctx, struct m_property *prop,
     return property_time(action, arg, 0);
 }
 
+static bool is_decoderless_container_probe(MPContext *mpctx)
+{
+    return mpctx->playback_initialized && mpctx->paused &&
+           !mpctx->opts->stream_auto_sel &&
+           !mpctx->vo_chain && !mpctx->ao_chain;
+}
+
+// Fork capability/readback for metadata-only source promotion. Unlike
+// time-pos/full, the pending target must not be clamped to media duration.
+static int mp_property_container_probe_seek_ready(void *ctx,
+    struct m_property *prop, int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    bool ready = is_decoderless_container_probe(mpctx) &&
+                 mpctx->hrseek_active && !mpctx->seek.type;
+    return m_property_bool_ro(action, arg, ready);
+}
+
+static int mp_property_container_probe_seek_target(void *ctx,
+    struct m_property *prop, int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    if (!is_decoderless_container_probe(mpctx) ||
+        !mpctx->hrseek_active || mpctx->seek.type)
+        return M_PROPERTY_UNAVAILABLE;
+    return m_property_double_ro(action, arg,
+                               mpctx->hrseek_pts * mpctx->play_dir);
+}
+
 /// Current position in seconds (RW)
 static int mp_property_time_pos(void *ctx, struct m_property *prop,
                                 int action, void *arg)
@@ -844,6 +873,11 @@ static int mp_property_time_pos(void *ctx, struct m_property *prop,
 
     if (action == M_PROPERTY_SET) {
         queue_seek(mpctx, MPSEEK_ABSOLUTE, *(double *)arg, MPSEEK_DEFAULT, 0);
+        // Do not leave the seek queued while a client can select the first
+        // chain in this same dispatch window: write_video precedes the normal
+        // queued-seek execution in run_playloop.
+        if (is_decoderless_container_probe(mpctx))
+            execute_queued_seek(mpctx);
         return M_PROPERTY_OK;
     }
     return property_time(action, arg, get_playback_time(mpctx));
@@ -4492,6 +4526,8 @@ static const struct m_property mp_properties_base[] = {
     {"core-idle", mp_property_core_idle},
     {"eof-reached", mp_property_eof_reached},
     {"seeking", mp_property_seeking},
+    {"mediakit-container-probe-seek-ready", mp_property_container_probe_seek_ready},
+    {"mediakit-container-probe-seek-target", mp_property_container_probe_seek_target},
     {"playback-abort", mp_property_playback_abort},
     {"cache-speed", mp_property_cache_speed},
     {"demuxer-cache-duration", mp_property_demuxer_cache_duration},

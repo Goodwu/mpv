@@ -330,10 +330,28 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
 
     double demux_pts = seek_pts;
 
-    bool hr_seek = seek.exact != MPSEEK_KEYFRAME && seek_pts != MP_NOPTS_VALUE &&
+    // Startup positioning (resume start, container-probe re-arm) issues
+    // DEFAULT-precision absolute seeks before the current entry has rendered
+    // any frame. Snap those to the nearest preceding keyframe: exact-target
+    // semantics would gate the first visible frame on downloading and
+    // decoding the whole GOP between the keyframe and the target, which on
+    // high-bitrate sources is seconds of network catch-up for a bounded
+    // (<= one GOP) position offset. Explicit EXACT requests and every seek
+    // after playback started keep exact semantics.
+    // !hrseek_active distinguishes "this entry never rendered a frame" from
+    // "no frame since the last seek": vo_has_frame resets on every seek, so
+    // without it an interactive seek issued during a previous seek's
+    // decode-through would be wrongly snapped to a keyframe (V2 P1).
+    bool startup_positioning = seek.exact == MPSEEK_DEFAULT &&
+        seek_pts != MP_NOPTS_VALUE && !mpctx->hrseek_active &&
+        mpctx->video_out && !vo_has_frame(mpctx->video_out);
+
+    bool hr_seek = !startup_positioning &&
+        seek.exact != MPSEEK_KEYFRAME && seek_pts != MP_NOPTS_VALUE &&
         (seek.exact >= MPSEEK_EXACT || opts->hr_seek == 1 ||
          (opts->hr_seek >= 0 && seek.type == MPSEEK_ABSOLUTE) ||
          (opts->hr_seek == 2 && (!mpctx->vo_chain || mpctx->vo_chain->is_sparse)));
+
 
     // Under certain circumstances, prefer SEEK_FACTOR.
     if (seek.type == MPSEEK_FACTOR && !hr_seek &&
@@ -1152,6 +1170,14 @@ static void handle_playback_time(struct MPContext *mpctx)
 static void handle_playback_restart(struct MPContext *mpctx)
 {
     struct MPOpts *opts = mpctx->opts;
+
+    // A paused metadata-only entry may seek before its first audio/video
+    // chain is selected. Keep the exact target until a real chain can consume
+    // it; completing a restart without either chain would discard hrseek and
+    // turn later track activation into a keyframe-only seek.
+    if (mpctx->paused && !opts->stream_auto_sel &&
+        !mpctx->vo_chain && !mpctx->ao_chain && mpctx->hrseek_active)
+        return;
 
     if (mpctx->audio_status < STATUS_READY ||
         mpctx->video_status < STATUS_READY)
