@@ -1423,7 +1423,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     // imported through the Android external YUV hwdec path, and never
     // overrides a --gamut-mapping-mode or --dscale the user set explicitly.
 #if HAVE_PL_EXTERNAL_YUV && \
-    (HAVE_PL_DOV_LINEAR_OPTIMIZE || HAVE_PL_DOV_LINEAR_DISABLE)
+    (HAVE_PL_DOVI_LINEAR_OPTIMIZE || HAVE_PL_DOVI_LINEAR_DISABLE)
     struct pl_color_map_params p5_sdr_color_map;
     if (frame->current && frame->current->params.dv_profile == 5 &&
         frame->current->params.repr.dovi &&
@@ -1438,7 +1438,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         if (opts->tone_map.gamut_mode == GAMUT_AUTO)
             p5_sdr_color_map.gamut_mapping = &pl_gamut_map_clip;
         params.color_map_params = &p5_sdr_color_map;
-#if HAVE_PL_DOV_LINEAR_OPTIMIZE
+#if HAVE_PL_DOVI_LINEAR_OPTIMIZE
         params.optimize_dovi_linear_decode = true;
 #else
         // Current libplacebo fork: the optimization is enabled by default,
