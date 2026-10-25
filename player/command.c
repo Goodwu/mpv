@@ -34,6 +34,7 @@
 #include <libavutil/avstring.h>
 #include <libavutil/common.h>
 #include <libavutil/timecode.h>
+#include <libavutil/pixdesc.h>
 
 #include "mpv_talloc.h"
 #include "client.h"
@@ -2074,6 +2075,28 @@ static int get_track_entry(int item, int action, void *arg, void *ctx)
     }
 
     bool has_crop = mp_rect_w(p.crop) > 0 && mp_rect_h(p.crop) > 0;
+    const char *source_primaries = NULL;
+    const char *source_transfer = NULL;
+    const char *source_matrix = NULL;
+    const char *source_range = NULL;
+    if (p.lav_codecpar) {
+        const AVCodecParameters *source = p.lav_codecpar;
+        if (source->color_primaries != AVCOL_PRI_RESERVED0 &&
+            source->color_primaries != AVCOL_PRI_UNSPECIFIED &&
+            source->color_primaries != AVCOL_PRI_RESERVED)
+            source_primaries = av_color_primaries_name(source->color_primaries);
+        if (source->color_trc != AVCOL_TRC_RESERVED0 &&
+            source->color_trc != AVCOL_TRC_UNSPECIFIED &&
+            source->color_trc != AVCOL_TRC_RESERVED)
+            source_transfer = av_color_transfer_name(source->color_trc);
+        if (source->color_space != AVCOL_SPC_UNSPECIFIED &&
+            source->color_space != AVCOL_SPC_RESERVED &&
+            source->color_space <= AVCOL_SPC_YCGCO_RO)
+            source_matrix = av_color_space_name(source->color_space);
+        if (source->color_range == AVCOL_RANGE_MPEG ||
+            source->color_range == AVCOL_RANGE_JPEG)
+            source_range = av_color_range_name(source->color_range);
+    }
     struct m_sub_property props[] = {
         {"id",          SUB_PROP_INT(track->user_tid)},
         {"type",        SUB_PROP_STR(stream_type_name(track->type)),
@@ -2115,6 +2138,14 @@ static int get_track_entry(int item, int action, void *arg, void *ctx)
                         .unavailable = !p.codec_profile},
         {"demux-w",     SUB_PROP_INT(p.disp_w), .unavailable = !p.disp_w},
         {"demux-h",     SUB_PROP_INT(p.disp_h), .unavailable = !p.disp_h},
+        {"demux-color-primaries", SUB_PROP_STR(source_primaries),
+                        .unavailable = !source_primaries},
+        {"demux-color-transfer", SUB_PROP_STR(source_transfer),
+                        .unavailable = !source_transfer},
+        {"demux-color-matrix", SUB_PROP_STR(source_matrix),
+                        .unavailable = !source_matrix},
+        {"demux-color-range", SUB_PROP_STR(source_range),
+                        .unavailable = !source_range},
         {"demux-crop-x",SUB_PROP_INT(p.crop.x0), .unavailable = !has_crop},
         {"demux-crop-y",SUB_PROP_INT(p.crop.y0), .unavailable = !has_crop},
         {"demux-crop-w",SUB_PROP_INT(mp_rect_w(p.crop)), .unavailable = !has_crop},

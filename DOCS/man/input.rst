@@ -3458,6 +3458,14 @@ Property list
     ``track-list/N/demux-w``, ``track-list/N/demux-h``
         Video size hint as indicated by the container. (Not always accurate.)
 
+    ``track-list/N/demux-color-primaries``,
+    ``track-list/N/demux-color-transfer``,
+    ``track-list/N/demux-color-matrix``, ``track-list/N/demux-color-range``
+        Source video color metadata as reported by libavformat, using the
+        original FFmpeg names (for example, ``bt2020``, ``arib-std-b67``,
+        ``bt2020nc``, and ``tv``). Unknown or reserved values are omitted.
+        These fields are independent of decoder output parameters.
+
     ``track-list/N/demux-crop-x``, ``track-list/N/demux-crop-y``
         Crop offset of the source video frame.
 

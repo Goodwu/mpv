@@ -1,5 +1,11 @@
 # TASKS.md
 
+## SOURCE-COLOR-TRACK-20261025
+
+- 状态：完成，用户授权本地提交，不推送；为 PiliPlus 播放诊断条新增独立片源色彩字段。mpv `track-list/N` 新增 `demux-color-primaries/transfer/matrix/range`，来源为解复用保留的原始 codec 参数；未知字段省略，解码输出属性保持原语义。标准源码整包VERIFIED（96d5b558…434571b）部署5台在线机并逐机核哈希；同包libmpv原生CLI在tagged/untagged SDR样本及current-tracks/video alias实测准确/缺失省略，库与UI定向测试和V1通过。唯一跨仓context：`/Users/wuweiwei1/src/PiliPlus/archives/conversations/playback-diag-bar-20261022.md`。
+- 本仓改动：`player/command.c` 与 `DOCS/man/input.rst`。使用 FFmpeg 原始名称（如 `bt2020/arib-std-b67/bt2020nc/tv`），严格省略 unknown/unspecified/reserved；不使用会将编码传递特性转换为 EOTF 的 libplacebo 映射，也不以非 lavf 的显示抽象色彩猜片源值。NDK `-fsyntax-only` 与 `git diff --check` 通过。media-kit已接入，Lead统一标准源码构建与设备/原生属性验收结果见首条；本仓实施者仅做源码与语法检查。
+
+
 ## VIDEO-STARTUP-NATIVE-BATCH-20261022
 
 - 状态：进行中，未提交；目标由 PiliPlus 线程定义为点击至实际视频显示少于2秒，尚未完成实机验收。
