@@ -4100,8 +4100,6 @@ static void initiate_refresh_seek(struct demux_internal *in,
         start_ts -= 1.0; // small offset to get correct overlap
     }
 
-    MP_VERBOSE(in, "MK_STARTUP_NATIVE refresh_seek target=%.6f stream=%d\n",
-               start_ts, stream->index);
     advance_seek_generation(in);
     in->seeking = true;
     in->seek_flags = SEEK_HR;
@@ -4140,8 +4138,6 @@ static void refresh_track(struct demux_internal *in, struct sh_stream *stream,
     // refresh would drag playback back a GOP instead of repositioning one
     // stream.
     if (in->d_thread->is_timeline && !ds->has_returned_packet) {
-        MP_VERBOSE(in, "MK_STARTUP_NATIVE refresh_skip_timeline stream=%d\n",
-                   stream->index);
         return;
     }
     if (!in->after_seek || (ds->type != STREAM_VIDEO && !avoid_refresh)) {
@@ -4163,38 +4159,15 @@ void demuxer_select_track(struct demuxer *demuxer, struct sh_stream *stream,
     // don't flush buffers if stream is already selected / unselected
     if (ds->selected != selected) {
         bool use_pending_seek = false;
-        int proof_reason = 1;
         uint64_t proof_generation = ds->pending_seek_generation;
         double proof_target = ds->pending_seek_target;
         double internal_ref_pts = MP_ADD_PTS(ref_pts, -in->ts_offset);
-        if (selected && proof_generation) {
-            if (proof_generation != in->seek_generation)
-                proof_reason = 2;
-            else if (in->seeking)
-                proof_reason = 3;
-            else if (in->back_demuxing)
-                proof_reason = 4;
-            else if (ds->has_returned_packet)
-                proof_reason = 5;
-            else if (ref_pts == MP_NOPTS_VALUE || !isfinite(ref_pts) ||
-                     !isfinite(internal_ref_pts) || !isfinite(proof_target))
-                proof_reason = 6;
-            else if (internal_ref_pts != proof_target)
-                proof_reason = 7;
-            else {
-                proof_reason = 0;
-                use_pending_seek = true;
-            }
-        }
-        if (proof_generation) {
-            MP_VERBOSE(in, "MK_STARTUP_NATIVE pending_proof_select stream=%d type=%d use=%d"
-                       " reason=%d proof_gen=%" PRIu64 " current_gen=%" PRIu64
-                       " seeking=%d backward=%d returned=%d ref=%.9f target=%.9f\n",
-                       ds->index, ds->type, use_pending_seek, proof_reason,
-                       proof_generation, in->seek_generation, in->seeking,
-                       in->back_demuxing, ds->has_returned_packet,
-                       internal_ref_pts, proof_target);
-        }
+        use_pending_seek = selected && proof_generation &&
+            proof_generation == in->seek_generation && !in->seeking &&
+            !in->back_demuxing && !ds->has_returned_packet &&
+            ref_pts != MP_NOPTS_VALUE && isfinite(ref_pts) &&
+            isfinite(internal_ref_pts) && isfinite(proof_target) &&
+            internal_ref_pts == proof_target;
         ds->pending_seek_generation = 0;
         ds->pending_seek_target = MP_NOPTS_VALUE;
 

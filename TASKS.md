@@ -8,10 +8,10 @@
 
 ## VIDEO-STARTUP-NATIVE-BATCH-20261022
 
-- 状态：进行中，未提交；目标由 PiliPlus 线程定义为点击至实际视频显示少于2秒，尚未完成实机验收。
-- 改动：新增可选 fork export `mpv_mediakit_get_property_strings`，在单次 `run_locked` 中按输入顺序使用原 `M_PROPERTY_GET_STRING` 读取并返回 STRING/NONE 节点数组，统一由 `mpv_free_node_contents` 释放。未改上游 API version；media-kit 动态发现符号，旧库保留 scalar fallback。
-- 边界：核心锁不等于全系统原子快照；仍保持上层身份/epoch、decoder头尾、输出与稳定性校验和超时排空；API isolate 与 event pump 继续分离。
-- 最新集成状态：pending-proof三native files（含cover-history修正）V2通过；标准APK `04d2f249…` native SHA `1026aaef1f07d2c15048d5fbf806237a3befb063e115d8bf49ae7b59888e5fe5`、JAR `0f2f91c57c07f0b3b85a3ab9da2862d38987cda3f82a6e60ae9cef53081180ab`。native专项582 basic/0 fail，37目标与封面断言全过，25 proof-use guard全过；JPEG历史负例通过，PNG缺decoder，cache-range-join/stale callback race未验证。SDK buffer恢复128KiB。`proof-clock1`正确帧2.290s、motion2.459s，use1 refresh已消失但目标<2秒未达。当前运行后续codec-stats诊断包native `5cccfaa8…`；单轮codec API计时显示非codec早段主要audio seek和demux供包，禁止推广成普遍归因。下一步仅只读评估bounded video prefetch及FFmpeg标准构建可行性；lazyTexture方向暂停。唯一context见PiliPlus记录。
+- 状态：用户于 2026-10-27 决定按完成状态关闭。本次关闭代表用户结束该任务，不代表历史“点击至实际视频显示少于 2 秒”指标通过；最后保留的观测仍高于该目标，见 PiliPlus context。
+- 历史实现：新增可选 fork export `mpv_mediakit_get_property_strings`，在单次 `run_locked` 中按输入顺序使用原 `M_PROPERTY_GET_STRING` 读取并返回 STRING/NONE 节点数组，统一由 `mpv_free_node_contents` 释放。未改上游 API version；media-kit 动态发现符号，旧库保留 scalar fallback。
+- 历史边界：核心锁不等于全系统原子快照；当时仍保持上层身份/epoch、decoder头尾、输出与稳定性校验和超时排空；API isolate 与 event pump 继续分离。
+- 收口：已移除 mpv 的 `MK_STARTUP_NATIVE` 日志和 media-kit 的 `MEDIA_KIT_STARTUP_TRACE` 输出开关及纯诊断状态，保留 seek、prefetch、HDR 探测与播放功能逻辑。最后的历史观测包括 `proof-clock1` 光学正确帧 2.290s、motion 2.459s，及单次 codec-stats 的 library-start→correct-frame 2.173s、first-packet→correct-frame 1.312s；这些样本未达到或证明稳定低于 2 秒。原计划只读评估 bounded video prefetch 与 FFmpeg 标准重建可行性未执行，随用户关闭一并取消，不再是待办。PNG、cache-range-join 与 stale-callback race 等历史覆盖缺口保留记录，不作为本次用户关闭的阻碍。详见 PiliPlus 唯一 context。
 - 唯一context：`/Users/wuweiwei1/src/PiliPlus/archives/conversations/video-startup-latency-20261022.md`。保留本仓既有占位初始化记录。
 
 ## ANDROID-YUV-PLACEHOLDER-20261021

@@ -249,7 +249,6 @@ typedef struct lavf_priv {
     bool any_ts_fixed;
 
     int retry_counter;
-    int startup_seek_id;
 
     AVDictionary *av_opts;
 
@@ -1409,36 +1408,13 @@ static void demux_seek_lavf(demuxer_t *demuxer, double seek_pts, int flags)
         }
     }
 
-    int seek_id = ++priv->startup_seek_id;
-    int64_t seek_start_us = mp_time_ns() / 1000;
-    int type = seek_stream >= 0 && (unsigned)seek_stream < priv->avfc->nb_streams
-             ? priv->avfc->streams[seek_stream]->codecpar->codec_type : -1;
-    MP_VERBOSE(demuxer, "MK_STARTUP_NATIVE lavf_seek_begin t_us=%" PRId64
-               " source=%d id=%d target=%.6f flags=%d stream=%d type=%d pts=%" PRId64 "\n",
-               seek_start_us, demuxer->depth, seek_id, seek_pts, flags,
-               seek_stream, type, seek_pts_av);
     int r = av_seek_frame(priv->avfc, seek_stream, seek_pts_av, avsflags);
-    int64_t seek_end_us = mp_time_ns() / 1000;
-    MP_VERBOSE(demuxer, "MK_STARTUP_NATIVE lavf_seek_end t_us=%" PRId64
-               " source=%d id=%d attempt=1 pts=%" PRId64 " result=%d elapsed_us=%" PRId64 "\n",
-               seek_end_us, demuxer->depth, seek_id, seek_pts_av, r,
-               seek_end_us - seek_start_us);
     if (r < 0 && (avsflags & AVSEEK_FLAG_BACKWARD)) {
         // When seeking before the beginning of the file, and seeking fails,
         // try again without the backwards flag to make it seek to the
         // beginning.
         avsflags &= ~AVSEEK_FLAG_BACKWARD;
-        int64_t retry_start_us = mp_time_ns() / 1000;
-        MP_VERBOSE(demuxer, "MK_STARTUP_NATIVE lavf_seek_begin t_us=%" PRId64
-                   " source=%d id=%d attempt=2 target=%.6f flags=%d stream=%d pts=%" PRId64 "\n",
-                   retry_start_us, demuxer->depth, seek_id, seek_pts, flags,
-                   seek_stream, seek_pts_av);
         r = av_seek_frame(priv->avfc, seek_stream, seek_pts_av, avsflags);
-        int64_t retry_end_us = mp_time_ns() / 1000;
-        MP_VERBOSE(demuxer, "MK_STARTUP_NATIVE lavf_seek_end t_us=%" PRId64
-                   " source=%d id=%d attempt=2 pts=%" PRId64 " result=%d elapsed_us=%" PRId64 "\n",
-                   retry_end_us, demuxer->depth, seek_id, seek_pts_av, r,
-                   retry_end_us - retry_start_us);
     }
 
     if (r < 0) {

@@ -16,7 +16,6 @@
  */
 
 #include <assert.h>
-#include <inttypes.h>
 #include <limits.h>
 #include <math.h>
 
@@ -80,7 +79,6 @@ struct virtual_source {
     double seek_pts;
     int seek_flags;
     uint64_t seek_token;
-    bool trace_first_read;
 
     struct demux_packet *next;
 
@@ -115,7 +113,6 @@ struct priv {
     struct virtual_stream *prefetch_audio_stream;
     uint64_t prefetch_token;
     double prefetch_target;
-    double prefetch_first_pts;
     bool prefetch_eligible;
     bool prefetch_started;
     bool prefetch_closed;
@@ -126,49 +123,13 @@ struct priv {
     int prefetch_packets;
     uint64_t prefetch_bytes;
     int64_t prefetch_deadline_us;
-    int64_t prefetch_start_us;
 };
 
-enum prefetch_close_reason {
-    PREFETCH_CLOSE_PACKET_LIMIT = 1,
-    PREFETCH_CLOSE_BYTE_LIMIT,
-    PREFETCH_CLOSE_TIME_LIMIT,
-    PREFETCH_CLOSE_TOKEN,
-    PREFETCH_CLOSE_VIDEO_READ,
-    PREFETCH_CLOSE_TRACKSWITCH,
-    PREFETCH_CLOSE_REPLACED,
-    PREFETCH_CLOSE_FIRST_PTS,
-    PREFETCH_CLOSE_IDENTITY,
-    PREFETCH_CLOSE_CANCELLED,
-    PREFETCH_CLOSE_QUEUE_LIMIT,
-};
-
-static int prefetch_source_index(struct priv *p, struct virtual_source *src)
-{
-    for (int n = 0; n < p->num_sources; n++) {
-        if (p->sources[n] == src)
-            return n;
-    }
-    return -1;
-}
-
-static void close_preroll_prefetch(struct demuxer *demuxer,
-                                   struct priv *p, int reason)
+static void close_preroll_prefetch(struct priv *p)
 {
     if (!p->prefetch_eligible || p->prefetch_closed)
         return;
 
-    int64_t now_us = mp_time_ns() / 1000;
-    MP_VERBOSE(demuxer, "MK_STARTUP_NATIVE preroll_prefetch event=close"
-               " reason=%d token=%" PRIu64 " packets=%d bytes=%" PRIu64
-               " elapsed_us=%" PRId64 " video_source=%d audio_source=%d"
-               " first_pts=%.9f target=%.9f\n",
-               reason, p->prefetch_token, p->prefetch_packets,
-               p->prefetch_bytes,
-               p->prefetch_started ? now_us - p->prefetch_start_us : 0,
-               prefetch_source_index(p, p->prefetch_video),
-               prefetch_source_index(p, p->prefetch_audio),
-               p->prefetch_first_pts, p->prefetch_target);
     p->prefetch_closed = true;
     p->prefetch_eligible = false;
 }
@@ -178,7 +139,7 @@ static bool preroll_prefetch_valid(struct demuxer *demuxer, struct priv *p)
     if (!p->prefetch_eligible || p->prefetch_closed)
         return false;
     if (!demux_startup_prefetch_token_valid(demuxer, p->prefetch_token)) {
-        close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_TOKEN);
+        close_preroll_prefetch(p);
         return false;
     }
     if (!p->prefetch_video || !p->prefetch_audio ||
@@ -192,15 +153,15 @@ static bool preroll_prefetch_valid(struct demuxer *demuxer, struct priv *p)
         p->prefetch_video_stream->sh->attached_picture ||
         p->prefetch_video_stream->sh->still_image)
     {
-        close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_IDENTITY);
+        close_preroll_prefetch(p);
         return false;
     }
     if (!p->prefetch_video_stream->selected) {
-        close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_IDENTITY);
+        close_preroll_prefetch(p);
         return false;
     }
     if (p->prefetch_started && !p->prefetch_audio_stream->selected) {
-        close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_IDENTITY);
+        close_preroll_prefetch(p);
         return false;
     }
     return true;
@@ -218,7 +179,7 @@ static void update_prefetch_track_state(struct demuxer *demuxer,
     if ((p->prefetch_video_selected_seen && !video_selected) ||
         (p->prefetch_audio_selected_seen && !audio_selected))
     {
-        close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_IDENTITY);
+        close_preroll_prefetch(p);
         p->prefetch_handoff = false;
     }
     p->prefetch_video_selected_seen |= video_selected;
@@ -523,9 +484,8 @@ static int *source_stream_indices(struct virtual_source *src)
 // pending-proof machinery asserts on.
 static void eager_seek_source(struct demuxer *demuxer,
                               struct virtual_source *src,
-                              double pts, int flags, int index)
+                              double pts, int flags)
 {
-    int64_t start_us = mp_time_ns() / 1000;
     seek_source(demuxer, src, pts, flags);
     // Only remember the eager position when the child actually opened;
     // a transient lazy-open failure must leave the state unset so the
@@ -534,9 +494,6 @@ static void eager_seek_source(struct demuxer *demuxer,
     src->eager_seek_done = positioned;
     src->eager_seek_pts = pts;
     src->eager_seek_flags = flags;
-    MP_VERBOSE(demuxer, "MK_STARTUP_NATIVE eager_seek source=%d"
-               " target=%.6f positioned=%d elapsed_us=%" PRId64 "\n",
-               index, pts, positioned, mp_time_ns() / 1000 - start_us);
 }
 
 static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt)
@@ -544,7 +501,7 @@ static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt
     struct priv *p = demuxer->priv;
     bool cancelled = demux_cancel_test(demuxer);
     if ((p->prefetch_eligible || p->prefetch_handoff) && cancelled) {
-        close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_CANCELLED);
+        close_preroll_prefetch(p);
         p->prefetch_handoff = false;
     }
     bool handoff = p->prefetch_handoff;
@@ -563,26 +520,16 @@ static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt
     if (preroll_prefetch_valid(demuxer, p)) {
         if (!p->prefetch_first_video_seen) {
             if (p->prefetch_audio_stream->selected)
-                close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_FIRST_PTS);
+                close_preroll_prefetch(p);
         } else if (!p->prefetch_started && p->prefetch_audio_stream->selected) {
             struct virtual_source *audio = p->prefetch_audio;
             if (!audio->seek_pending || audio->seek_token != p->prefetch_token ||
                 audio->seek_pts != p->prefetch_target)
             {
-                close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_IDENTITY);
+                close_preroll_prefetch(p);
             } else {
                 p->prefetch_started = true;
-                p->prefetch_start_us = mp_time_ns() / 1000;
-                p->prefetch_deadline_us = p->prefetch_start_us + 50000;
-                MP_VERBOSE(demuxer, "MK_STARTUP_NATIVE preroll_prefetch event=start"
-                           " token=%" PRIu64 " video_source=%d audio_source=%d"
-                           " packets=0 bytes=0 elapsed_us=0"
-                           " first_pts=%.9f target=%.9f\n",
-                           p->prefetch_token,
-                           prefetch_source_index(p, p->prefetch_video),
-                           prefetch_source_index(p, p->prefetch_audio),
-                           p->prefetch_first_pts,
-                           p->prefetch_target);
+                p->prefetch_deadline_us = mp_time_ns() / 1000 + 50000;
             }
         }
     }
@@ -591,11 +538,11 @@ static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt
     if (prefetch) {
         int64_t now_us = mp_time_ns() / 1000;
         if (now_us >= p->prefetch_deadline_us)
-            close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_TIME_LIMIT);
+            close_preroll_prefetch(p);
         else if (p->prefetch_packets >= 32)
-            close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_PACKET_LIMIT);
+            close_preroll_prefetch(p);
         else if (p->prefetch_bytes >= 1024 * 1024)
-            close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_BYTE_LIMIT);
+            close_preroll_prefetch(p);
     }
     prefetch = p->prefetch_started && p->prefetch_eligible &&
                !p->prefetch_closed;
@@ -605,11 +552,11 @@ static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt
         bool has_room = demux_startup_prefetch_has_room(
             demuxer, p->prefetch_token, NULL, &token_valid);
         if (!token_valid) {
-            close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_TOKEN);
+            close_preroll_prefetch(p);
             prefetch = false;
         } else if (!has_room) {
             handoff = p->prefetch_handoff = true;
-            close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_QUEUE_LIMIT);
+            close_preroll_prefetch(p);
             prefetch = false;
         }
     }
@@ -620,7 +567,6 @@ static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt
         bool handoff_pass = handoff && !prefetch_pass &&
                             (!prefetch || pass > 0);
         struct virtual_source *src = NULL;
-        int src_index = -1;
 
         for (int x = 0; x < p->num_sources; x++) {
             struct virtual_source *cur = p->sources[x];
@@ -640,26 +586,14 @@ static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt
                 demux_clear_pending_seek(demuxer, seek_token, indices,
                                          cur->num_streams);
                 talloc_free(indices);
-                int64_t start_us = mp_time_ns() / 1000;
-                MP_VERBOSE(demuxer, "MK_STARTUP_NATIVE timeline_pending_begin t_us=%" PRId64
-                           " source=%d target=%.6f flags=%d\n",
-                           start_us, x, seek_pts, seek_flags);
                 cur->seek_pending = false;
                 cur->seek_token = 0;
-                if (cur->eager_seek_done && cur->eager_seek_pts == seek_pts &&
-                    cur->eager_seek_flags == seek_flags)
+                if (!cur->eager_seek_done || cur->eager_seek_pts != seek_pts ||
+                    cur->eager_seek_flags != seek_flags)
                 {
-                    MP_VERBOSE(demuxer, "MK_STARTUP_NATIVE eager_pending_skip"
-                               " source=%d\n", x);
-                } else {
                     cur->eager_seek_done = false;
                     seek_source(demuxer, cur, seek_pts, seek_flags);
                 }
-                int64_t end_us = mp_time_ns() / 1000;
-                MP_VERBOSE(demuxer, "MK_STARTUP_NATIVE timeline_pending_end t_us=%" PRId64
-                           " source=%d target=%.6f flags=%d elapsed_us=%" PRId64 "\n",
-                           end_us, x, seek_pts, seek_flags, end_us - start_us);
-                cur->trace_first_read = true;
             }
 
             if (cur->eof_reached)
@@ -674,13 +608,12 @@ static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt
             if (!src || cur->dts == MP_NOPTS_VALUE ||
                 (src->dts != MP_NOPTS_VALUE && cur->dts < src->dts)) {
                 src = cur;
-                src_index = x;
             }
         }
 
         if (!src) {
             if (prefetch_pass) {
-                close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_VIDEO_READ);
+                close_preroll_prefetch(p);
                 continue;
             }
             if (handoff_pass) {
@@ -699,25 +632,10 @@ static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt
             return false;
         }
 
-        if (src->trace_first_read) {
-            int64_t start_us = mp_time_ns() / 1000;
-            MP_VERBOSE(demuxer, "MK_STARTUP_NATIVE timeline_read_begin t_us=%" PRId64
-                       " source=%d target=%.6f flags=%d\n",
-                       start_us, src_index, src->seek_pts, src->seek_flags);
-            do_read_next_packet(demuxer, src);
-            int64_t end_us = mp_time_ns() / 1000;
-            MP_VERBOSE(demuxer, "MK_STARTUP_NATIVE timeline_read_end t_us=%" PRId64
-                       " source=%d pts=%.6f elapsed_us=%" PRId64 "\n",
-                       end_us, src_index,
-                       src->next ? src->next->pts : MP_NOPTS_VALUE,
-                       end_us - start_us);
-            src->trace_first_read = false;
-        } else {
-            do_read_next_packet(demuxer, src);
-        }
+        do_read_next_packet(demuxer, src);
 
         if (prefetch_pass && !src->next) {
-            close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_VIDEO_READ);
+            close_preroll_prefetch(p);
             continue;
         }
 
@@ -737,7 +655,7 @@ static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt
             bool has_room = demux_startup_prefetch_has_room(
                 demuxer, p->prefetch_token, src->next, &token_valid);
             if (!token_valid) {
-                close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_TOKEN);
+                close_preroll_prefetch(p);
                 if (!has_room) {
                     *out_pkt = NULL;
                     return true;
@@ -745,7 +663,7 @@ static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt
                 prefetch = false;
             } else if (!has_room) {
                 handoff = p->prefetch_handoff = true;
-                close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_QUEUE_LIMIT);
+                close_preroll_prefetch(p);
                 continue;
             }
         }
@@ -760,11 +678,11 @@ static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt
             p->prefetch_packets++;
             p->prefetch_bytes += (*out_pkt)->len;
             if (p->prefetch_packets >= 32)
-                close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_PACKET_LIMIT);
+                close_preroll_prefetch(p);
             else if (p->prefetch_bytes >= 1024 * 1024)
-                close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_BYTE_LIMIT);
+                close_preroll_prefetch(p);
             else if (mp_time_ns() / 1000 >= p->prefetch_deadline_us)
-                close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_TIME_LIMIT);
+                close_preroll_prefetch(p);
         } else if (*out_pkt && p->prefetch_eligible && !p->prefetch_closed &&
                    !p->prefetch_first_video_seen &&
                    src == p->prefetch_video)
@@ -774,13 +692,7 @@ static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt
             if (pts == MP_NOPTS_VALUE || !isfinite(pts) ||
                 p->prefetch_target - pts < 1.0)
             {
-                p->prefetch_first_pts = isfinite(pts) &&
-                                        pts != MP_NOPTS_VALUE ? pts :
-                                        MP_NOPTS_VALUE;
-                close_preroll_prefetch(demuxer, p,
-                                       PREFETCH_CLOSE_FIRST_PTS);
-            } else {
-                p->prefetch_first_pts = pts;
+                close_preroll_prefetch(p);
             }
         }
         return true;
@@ -810,14 +722,13 @@ static void d_seek(struct demuxer *demuxer, double seek_pts, int flags)
 {
     struct priv *p = demuxer->priv;
     if (p->prefetch_eligible)
-        close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_REPLACED);
+        close_preroll_prefetch(p);
     p->prefetch_video = NULL;
     p->prefetch_video_stream = NULL;
     p->prefetch_audio = NULL;
     p->prefetch_audio_stream = NULL;
     p->prefetch_token = 0;
     p->prefetch_target = MP_NOPTS_VALUE;
-    p->prefetch_first_pts = MP_NOPTS_VALUE;
     p->prefetch_eligible = false;
     p->prefetch_started = false;
     p->prefetch_closed = false;
@@ -828,7 +739,6 @@ static void d_seek(struct demuxer *demuxer, double seek_pts, int flags)
     p->prefetch_packets = 0;
     p->prefetch_bytes = 0;
     p->prefetch_deadline_us = 0;
-    p->prefetch_start_us = 0;
     uint64_t seek_token = demux_get_active_seek_callback_token(demuxer);
 
     seek_pts = seek_pts * ((flags & SEEK_FACTOR) ? p->duration : 1);
@@ -875,13 +785,9 @@ static void d_seek(struct demuxer *demuxer, double seek_pts, int flags)
         talloc_free(indices);
         master->seek_pending = false;
         master->seek_token = 0;
-        master->trace_first_read = false;
-        if (master->eager_seek_done && master->eager_seek_pts == seek_pts &&
-            master->eager_seek_flags == flags)
+        if (!master->eager_seek_done || master->eager_seek_pts != seek_pts ||
+            master->eager_seek_flags != flags)
         {
-            MP_VERBOSE(demuxer, "MK_STARTUP_NATIVE eager_seek_skip source=%d"
-                       " target=%.6f\n", -1, seek_pts);
-        } else {
             master->eager_seek_done = false;
             seek_source(demuxer, master, seek_pts, flags);
         }
@@ -901,17 +807,13 @@ static void d_seek(struct demuxer *demuxer, double seek_pts, int flags)
         if (src->seek_token)
             demux_clear_pending_seek(demuxer, src->seek_token, indices,
                                      src->num_streams);
-        src->trace_first_read = false;
         if (src->any_selected) {
             src->seek_pending = false;
             src->seek_token = 0;
             if (src != master) {
-                if (src->eager_seek_done && src->eager_seek_pts == seek_pts &&
-                    src->eager_seek_flags == flags)
+                if (!src->eager_seek_done || src->eager_seek_pts != seek_pts ||
+                    src->eager_seek_flags != flags)
                 {
-                    MP_VERBOSE(demuxer, "MK_STARTUP_NATIVE eager_seek_skip"
-                               " source=%d target=%.6f\n", x, seek_pts);
-                } else {
                     src->eager_seek_done = false;
                     seek_source(demuxer, src, seek_pts, flags);
                 }
@@ -923,16 +825,13 @@ static void d_seek(struct demuxer *demuxer, double seek_pts, int flags)
             src->seek_token = seek_token;
             bool published = demux_publish_pending_seek(
                 demuxer, seek_token, indices, src->num_streams, seek_pts);
-            MP_VERBOSE(demuxer, "MK_STARTUP_NATIVE pending_proof_publish"
-                       " source=%d token=%" PRIu64 " target=%.9f streams=%d published=%d\n",
-                       x, seek_token, seek_pts, src->num_streams, published);
             if (x < MP_ARRAY_SIZE(source_published))
                 source_published[x] = published;
             if (!src->eager_seek_done || src->eager_seek_pts != seek_pts ||
                 src->eager_seek_flags != flags)
             {
                 src->eager_seek_done = false;
-                eager_seek_source(demuxer, src, seek_pts, flags, x);
+                eager_seek_source(demuxer, src, seek_pts, flags);
             }
         } else {
             src->seek_pending = false;
@@ -945,9 +844,8 @@ static void d_seek(struct demuxer *demuxer, double seek_pts, int flags)
     // Eligibility deliberately omits demux_startup_prefetch_token_valid():
     // d_seek runs with the demux lock released, so a concurrent seek can
     // advance seek_generation between the publishes above and such a check,
-    // which made prefetch eligibility drop out entirely on the rapid
-    // double-armed seeks of startup (no preroll_prefetch event was ever
-    // logged before this omission). demux_publish_pending_seek() already
+    // which made prefetch eligibility drop out entirely on rapid double-armed
+    // startup seeks. demux_publish_pending_seek() already
     // proved token == executing_seek_generation == seek_generation at
     // publish time; every read-time path re-validates the full condition
     // before any prefetch packet is read.
@@ -979,7 +877,6 @@ static void d_seek(struct demuxer *demuxer, double seek_pts, int flags)
             p->prefetch_audio_stream = audio_stream;
             p->prefetch_token = seek_token;
             p->prefetch_target = seek_pts;
-            p->prefetch_first_pts = MP_NOPTS_VALUE;
             p->prefetch_eligible = true;
         }
     }
@@ -1224,7 +1121,7 @@ static void d_switched_tracks(struct demuxer *demuxer)
 {
     struct priv *p = demuxer->priv;
     if (p->prefetch_started) {
-        close_preroll_prefetch(demuxer, p, PREFETCH_CLOSE_TRACKSWITCH);
+        close_preroll_prefetch(p);
         p->prefetch_handoff = false;
     }
     reselect_streams(demuxer);
