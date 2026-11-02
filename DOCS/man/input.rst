@@ -2727,6 +2727,13 @@ Property list
     hardware decoder. Since mpv 0.18.0, ``hwdec-current`` is available for
     this purpose.
 
+``android-surfacetexture-publish-flush-api``
+    Read-only integer feature version for the Android SurfaceTexture publish
+    flush policy. Version 1 exposes ``surfacetexture-publish-flush`` with the
+    conservative nominal-frame-rate gate described in its option reference.
+    Returns 0 when Android OpenGL hardware interop is not built. This is a
+    compiled capability, not proof that a session uses the policy.
+
 ``hwdec-current``
     The current hardware decoding in use. If decoding is active, return one of
     the values used by the ``hwdec`` option/property. ``no`` indicates

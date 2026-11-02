@@ -2385,6 +2385,12 @@ static int mp_property_android_native_dv_api(void *ctx, struct m_property *prop,
     return m_property_int_ro(action, arg, mp_avcodec_native_dv_api(codec));
 }
 
+static int mp_property_android_st_publish_flush_api(void *ctx,
+    struct m_property *prop, int action, void *arg)
+{
+    return m_property_int_ro(action, arg, HAVE_ANDROID_GL_HWDEC ? 1 : 0);
+}
+
 static int mp_property_android_mediacodec_info(void *ctx, struct m_property *prop,
                                               int action, void *arg)
 {
@@ -4630,6 +4636,7 @@ static const struct m_property mp_properties_base[] = {
     {"vid", mp_property_switch_track, .priv = (void *)(const int[]){0, STREAM_VIDEO}},
     {"hwdec-current", mp_property_hwdec_current},
     {"android-native-dv-bridge-api", mp_property_android_native_dv_api},
+    {"android-surfacetexture-publish-flush-api", mp_property_android_st_publish_flush_api},
     {"android-mediacodec-info", mp_property_android_mediacodec_info},
     {"hwdec-interop", mp_property_hwdec_interop},
 

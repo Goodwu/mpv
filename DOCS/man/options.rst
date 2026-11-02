@@ -1860,6 +1860,18 @@ Video
     If this is set to 0, the number of threads will be automatically determined
     by the number of CPU cores available.
 
+``--surfacetexture-publish-flush=<immediate|defer-30fps>``
+    Policy for the Android SurfaceTexture importer's publish-copy flush
+    (default: ``immediate``). ``defer-30fps`` permits deferring that explicit
+    flush only for frames whose nominal frame rate is 30000/1001 or 30 fps
+    (within 0.001 fps). Missing, non-finite and other frame rates retain the
+    immediate flush. This does not change texture precision, copy operations,
+    fences, retirement flushes or rendering submission flushes.
+
+    This option can be changed without recreating the VO; it is re-read at the
+    next mapping operation. It does not select a decoder or presentation route
+    and does not imply any power or temperature improvement.
+
 ``--hwdec-software-fallback=<yes|no|N>``
     Fallback to software decoding if the hardware-accelerated decoder fails
     (default: 3). If this is a number, then fallback will be triggered if

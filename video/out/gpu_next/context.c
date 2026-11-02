@@ -28,6 +28,10 @@
 #include "context.h"
 #include "config.h"
 #include "common/common.h"
+#if HAVE_ANDROID
+#include <sys/system_properties.h>
+#include <dlfcn.h>
+#endif
 #include "options/m_config.h"
 #include "video/out/placebo/utils.h"
 #include "video/out/gpu/video.h"
@@ -41,13 +45,58 @@
 #if HAVE_GL
 #include "video/out/opengl/context.h"
 #include "video/out/opengl/ra_gl.h"
-# if HAVE_EGL
+# if HAVE_EGL || HAVE_EGL_ANDROID
 #include <EGL/egl.h>
 # endif
 #endif
 
 #if HAVE_VULKAN
 #include "video/out/vulkan/context.h"
+#endif
+
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && HAVE_ANDROID && HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_YUV_COMPARE)
+#include "video/out/opengl/mks_yuv_compare.h"
+
+// EGL 1.4 does not require eglGetProcAddress to expose core EGL symbols. The
+// explicit capture loader can resolve missing core functions from linked EGL;
+// ordinary creation retains mpv's original get_proc_addr callback unchanged.
+static pl_voidfunc_t yuv_compare_get_proc(void *priv, const char *name)
+{
+    struct GL *gl = priv;
+    void *fn = gl->get_fn(gl->fn_ctx, name);
+    if (!fn && !strncmp(name, "egl", 3))
+        fn = dlsym(RTLD_DEFAULT, name);
+    return (pl_voidfunc_t)fn;
+}
+
+static bool configure_yuv_compare_egl(struct gpu_ctx *ctx,
+                                     struct pl_opengl_params *params,
+                                     struct GL *gl, bool diagnostic_compare)
+{
+    if (!diagnostic_compare)
+        return true;
+    // HAVE_EGL can be false even though Android/EGL is active. Only
+    // capture explicitly enables this owner/loader contract; default
+    // Android GPU capabilities and imports retain their old behavior.
+    if (!gl->get_fn || !mks_android_yuv_compare_owner_current(ctx->ra_ctx) ||
+        eglGetCurrentDisplay() == EGL_NO_DISPLAY ||
+        eglGetCurrentContext() == EGL_NO_CONTEXT ||
+        eglGetCurrentSurface(EGL_DRAW) == EGL_NO_SURFACE ||
+        eglGetCurrentSurface(EGL_READ) == EGL_NO_SURFACE)
+    {
+        MP_ERR(ctx, "MKS-YUV-COMPARE event=egl-owner-rejected before-lib-create=1\n");
+        return false;
+    }
+    params->egl_display = eglGetCurrentDisplay();
+    params->egl_context = eglGetCurrentContext();
+    params->get_proc_addr_ex = yuv_compare_get_proc;
+    params->proc_ctx = gl;
+#ifdef PL_HAVE_MKS_YUV_COMPARE_CAPS
+    params->diagnostic_yuv_compare_caps = true;
+#endif
+    MP_ERR(ctx, "MKS-YUV-COMPARE event=egl-owner-configured android-current-verified=1 egl-loader-requested=1\n");
+    return true;
+}
 #endif
 
 #if HAVE_D3D11
@@ -143,6 +192,26 @@ struct gpu_ctx *gpu_ctx_create(struct vo *vo, struct ra_ctx_opts *ctx_opts)
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
     if (ra_is_gl(ctx->ra_ctx->ra)) {
         struct GL *gl = ra_gl_get(ctx->ra_ctx->ra);
+#if HAVE_ANDROID && (defined(PL_HAVE_MKS_YUV_COMPARE) || defined(PL_HAVE_MKS_YUV_ABORT_FRAME))
+        char yuv_compare[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.mks.yuv_compare", yuv_compare);
+        bool compare_session = !strcmp(yuv_compare, "1");
+        bool diagnostic_compare = compare_session;
+        // The UV table is an opt-in (user ruling 2026-11-02: untabled
+        // fusion is the default). When opted in it seeds through the same
+        // atlas machinery and needs this capability cache, without opening
+        // any compare transaction. An unsupported owner/loader contract must
+        // not break playback: degrade to no capability cache (seeds then
+        // fail arming and the failure budget disables the table for the
+        // session). An explicit compare session keeps the strict failure
+        // contract.
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+        char fusion_table[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.mks.yuv_fusion_table", fusion_table);
+        if (!diagnostic_compare && !strcmp(fusion_table, "1"))
+            diagnostic_compare = true;
+#endif
+#endif
         struct pl_opengl_params params = *pl_opengl_params(
             .debug = ctx_opts->debug,
             .allow_software = ctx_opts->allow_sw,
@@ -153,6 +222,15 @@ struct gpu_ctx *gpu_ctx_create(struct vo *vo, struct ra_ctx_opts *ctx_opts)
         params.egl_display = eglGetCurrentDisplay();
         params.egl_context = eglGetCurrentContext();
 # endif
+#if HAVE_ANDROID && HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_YUV_COMPARE)
+        if (diagnostic_compare &&
+            !configure_yuv_compare_egl(ctx, &params, gl, diagnostic_compare)) {
+            if (compare_session)
+                goto err_out;
+            MP_ERR(ctx, "MKS-FUSION-TABLE event=caps-unavailable playback-continues\n");
+            diagnostic_compare = false;
+        }
+#endif
         pl_opengl opengl = pl_opengl_create(ctx->pllog, &params);
         if (!opengl)
             goto err_out;
@@ -163,6 +241,9 @@ struct gpu_ctx *gpu_ctx_create(struct vo *vo, struct ra_ctx_opts *ctx_opts)
         ctx->swapchain = pl_opengl_create_swapchain(opengl, pl_opengl_swapchain_params(
             .max_swapchain_depth = vo->opts->swapchain_depth,
             .framebuffer.flipped = gl->flipped,
+#if HAVE_ANDROID && defined(PL_HAVE_MKS_YUV_ABORT_FRAME)
+            .diagnostic_abort_frame_no_gl = diagnostic_compare,
+#endif
 #if HAVE_EGL_ANDROID
             // MKS YUV diag (lab-gated, default off): when THIS Android EGL
             // context took the YUV diag branch, point the libplacebo

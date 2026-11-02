@@ -60,7 +60,10 @@
 #include <libavutil/hwcontext_mediacodec.h>
 
 #include "osdep/timer.h"
+#include "options/m_config.h"
 #include "video/out/gpu/hwdec.h"
+#include "video/out/mks_thermal.h"
+#include "video/out/mks_gpu_timer.h"
 #include "video/out/opengl/ra_gl.h"
 #include "video/mp_image.h"
 
@@ -215,6 +218,22 @@ struct mkst_consumed {
 struct priv {
     GL *gl;
     struct mp_log *log;
+    struct mks_thermal_trace thermal;
+    struct mks_gpu_timer gpu_copy_timer;
+    struct m_config_cache *flush_opts_cache;
+    struct surfacetexture_opts *flush_opts;
+    int flush_override; // -1=owned option, 0/1=explicit creation-time experiment
+    bool logged_flush_decision;
+    // Only publish flush can be deferred. Renderer and mapper share a GL
+    // context; unmap/retirement still flushes. Heat benefit is not implied.
+    bool defer_publish_flush;
+
+    // Independent creation-time PoC: borrow each lease texture's existing RA
+    // FBO instead of reattaching it to the shared copy FBO. No discard or
+    // pixel/shader/state/synchronization change is part of this experiment.
+    bool slot_fbo_diag, slot_fbo_reuse;
+    uint64_t slot_fbo_attempts, shared_fbo_attempts, slot_fbo_fallbacks;
+    uint64_t slot_fbo_copy_failures;
 
     // Bridge-owned OES texture, wrapped for ra (we never create/delete the
     // GL texture object itself).
@@ -264,6 +283,9 @@ struct priv {
     uint64_t fence_created_count;
     uint64_t fence_deleted_count;
     uint64_t fence_create_failed_count;
+    uint64_t publish_flush_count;
+    uint64_t publish_deferred_count;
+    uint64_t retire_flush_count;
     uint64_t retire_count;
     uint64_t reap_count;
     uint64_t reap_stuck_count;
@@ -583,10 +605,24 @@ static GLuint build_copy_program(struct ra_hwdec_mapper *mapper)
     return prog;
 }
 
+static void slot_fbo_report(struct ra_hwdec_mapper *mapper, bool final)
+{
+    struct priv *p = mapper->priv;
+    uint64_t attempts = p->slot_fbo_attempts + p->shared_fbo_attempts;
+    if (p->slot_fbo_diag && (final || attempts == 1 || attempts % 300 == 0))
+        MP_ERR(mapper, "MKS-INPUT-FBO requested=%d slot_attempts=%"PRIu64
+                       " shared_attempts=%"PRIu64" fallbacks=%"PRIu64
+                       " copy_failures=%"PRIu64" final=%d\n",
+               p->slot_fbo_reuse, p->slot_fbo_attempts, p->shared_fbo_attempts,
+               p->slot_fbo_fallbacks, p->slot_fbo_copy_failures, final);
+}
+
 // Identity copy of the current OES texture content into dst_name. The caller
 // must have latched (updateTexImage ran on this thread) beforehand.
+// dst_fbo is a borrowed RA-owned FBO for this exact live destination texture,
+// or 0 for the original shared attachment/check path. The format probe uses 0.
 static bool draw_copy(struct ra_hwdec_mapper *mapper, GLuint dst_name,
-                      int w, int h)
+                      GLuint dst_fbo, int w, int h, bool measure, double pts)
 {
     struct priv *p = mapper->priv;
     GL *gl = p->gl;
@@ -607,16 +643,22 @@ static bool draw_copy(struct ra_hwdec_mapper *mapper, GLuint dst_name,
     gl->ActiveTexture(GL_TEXTURE0);
     gl->GetIntegerv(GL_TEXTURE_BINDING_EXTERNAL_OES, &old_oes);
 
-    gl->BindFramebuffer(GL_FRAMEBUFFER, p->fbo);
-    gl->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                             GL_TEXTURE_2D, dst_name, 0);
-    GLenum fbo_status = gl->CheckFramebufferStatus(GL_FRAMEBUFFER);
+    gl->BindFramebuffer(GL_FRAMEBUFFER, dst_fbo ? dst_fbo : p->fbo);
+    GLenum fbo_status = GL_FRAMEBUFFER_COMPLETE;
+    if (!dst_fbo) {
+        gl->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                 GL_TEXTURE_2D, dst_name, 0);
+        fbo_status = gl->CheckFramebufferStatus(GL_FRAMEBUFFER);
+    }
     bool ok = fbo_status == GL_FRAMEBUFFER_COMPLETE;
     if (ok) {
         gl->Viewport(0, 0, w, h);
         gl->UseProgram(p->program);
         gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, p->oes_tex_name);
+        bool timed = measure && mks_gpu_timer_begin(&p->gpu_copy_timer, gl,
+                                         mapper->log, "input-copy", pts);
         gl->DrawArrays(GL_TRIANGLES, 0, 3);
+        mks_gpu_timer_end(&p->gpu_copy_timer, timed);
         ok = gl->GetError() == GL_NO_ERROR;
     }
     gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, old_oes);
@@ -626,6 +668,15 @@ static bool draw_copy(struct ra_hwdec_mapper *mapper, GLuint dst_name,
                  old_viewport[2], old_viewport[3]);
     gl->UseProgram(old_program);
     gl->ActiveTexture(old_active);
+
+    if (measure && p->slot_fbo_diag) {
+        if (dst_fbo)
+            p->slot_fbo_attempts++;
+        else
+            p->shared_fbo_attempts++;
+        p->slot_fbo_copy_failures += !ok;
+        slot_fbo_report(mapper, false);
+    }
 
     if (!ok)
         MP_ERR(mapper, "MKSURF: copy draw failed (fbo status=0x%x)\n", fbo_status);
@@ -725,7 +776,7 @@ static bool probe_draw(struct ra_hwdec_mapper *mapper, const struct ra_format *f
     GLuint name = 0;
     GLenum target = 0;
     ra_gl_get_raw_tex(mapper->ra, tex, &name, &target);
-    bool ok = draw_copy(mapper, name, 4, 4);
+    bool ok = draw_copy(mapper, name, 0, 4, 4, false, NAN);
     ra_tex_free(mapper->ra, &tex);
     return ok;
 }
@@ -800,6 +851,39 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
     p->gl = ra_gl_get(mapper->ra);
     GL *gl = p->gl;
     p->log = mapper->log;
+    p->flush_opts_cache = m_config_cache_alloc(p, mapper->owner->global,
+                                              &surfacetexture_conf);
+    p->flush_opts = p->flush_opts_cache->opts;
+    p->flush_override = -1;
+#if HAVE_ANDROID
+    char slot_fbo[PROP_VALUE_MAX] = {0};
+    if (__system_property_get("debug.mks.st_fbo", slot_fbo) > 0) {
+        if (!strcmp(slot_fbo, "0") || !strcmp(slot_fbo, "1")) {
+            p->slot_fbo_diag = true;
+            p->slot_fbo_reuse = !strcmp(slot_fbo, "1");
+            MP_ERR(mapper, "MKS-INPUT-FBO event=config requested=%d\n", p->slot_fbo_reuse);
+        } else {
+            MP_WARN(mapper, "MKS-INPUT-FBO invalid override; using original shared FBO\n");
+        }
+    }
+    char defer_flush[PROP_VALUE_MAX];
+    if (__system_property_get("debug.mks.defer_publish_flush", defer_flush) > 0) {
+        if (strcmp(defer_flush, "0") == 0 || strcmp(defer_flush, "1") == 0)
+            p->flush_override = defer_flush[0] - '0';
+        else
+            MP_WARN(mapper, "MKSURF: invalid diagnostic publish-flush override; "
+                            "using owned option\n");
+    }
+#endif
+    p->defer_publish_flush = p->flush_override == 1;
+    p->thermal.flush_policy = p->flush_opts->publish_flush;
+    p->thermal.flush_override = p->flush_override;
+    p->thermal.defer_publish_flush = p->defer_publish_flush;
+    mks_thermal_init(&p->thermal, mapper->log, "import", p);
+    if (p->thermal.enabled) {
+        p->thermal.w = mapper->src_params.w;
+        p->thermal.h = mapper->src_params.h;
+    }
 
     // The zero-allocated priv aliases slot 0; mark every lease empty before
     // any early-failure return can reach unmap/uninit.
@@ -945,18 +1029,35 @@ static void fence_delete(struct ra_hwdec_mapper *mapper, GLsync *fence)
     }
 }
 
+// Copy rare error counters into the rate-limited trace before requesting a
+// sample. mks_thermal_report enforces the existing 10-second cadence.
+static void thermal_report_errors(struct priv *p)
+{
+    p->thermal.fence_create_failed = p->fence_create_failed_count;
+    p->thermal.reap_stuck = p->reap_stuck_count;
+    p->thermal.latch_timeout = p->latch_timeout_count;
+    p->thermal.stale_drop = p->stale_drop_count;
+    mks_thermal_report(&p->thermal, false);
+}
+
 // Create a retirement/copy fence. NULL return must fail the publishing map
 // (no fenceless publication while GL fences are supported).
-static GLsync fence_create(struct ra_hwdec_mapper *mapper)
+static GLsync fence_create(struct ra_hwdec_mapper *mapper, bool flush_now)
 {
     struct priv *p = mapper->priv;
 
     GLsync fence = p->gl->FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     if (fence) {
         p->fence_created_count++;
-        p->gl->Flush();
+        if (flush_now) {
+            p->gl->Flush();
+        } else {
+            p->publish_deferred_count++;
+            p->thermal.publish_deferred = p->publish_deferred_count;
+        }
     } else {
         p->fence_create_failed_count++;
+        thermal_report_errors(p);
     }
     return fence;
 }
@@ -1074,6 +1175,7 @@ static void retire_reap(struct ra_hwdec_mapper *mapper, int max_keep)
                 if (status != GL_ALREADY_SIGNALED &&
                     status != GL_CONDITION_SATISFIED) {
                     p->reap_stuck_count++;
+                    thermal_report_errors(p);
                     MP_WARN(mapper, "MKSURF: retire fence stuck after %d ms; "
                                     "releasing anyway (stuck_count=%"PRIu64")\n",
                             MKSURF_REAP_TIMEOUT_MS, p->reap_stuck_count);
@@ -1168,6 +1270,11 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     struct priv *p = mapper->priv;
     struct priv_owner *o = mapper->owner->priv;
 
+    // This cache is owned and used only by the mapper thread. This independent
+    // option group has no UPDATE_VO/HWDEC side effect: a route restore takes
+    // effect at the next map, including when the same mapper is reused.
+    m_config_cache_update(p->flush_opts_cache);
+
     if (mapper->src->imgfmt != IMGFMT_MEDIACODEC)
         return -1;
 
@@ -1197,6 +1304,11 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     //    cur is usually empty here).
     if (p->cur.slot >= 0 && lease_matches(&p->cur, mapper->src)) {
         mapper->tex[0] = p->slots[p->cur.slot].tex;
+        if (p->thermal.enabled) {
+            p->thermal.lease_reuse++;
+            p->thermal.pts = src_pts;
+            mks_thermal_report(&p->thermal, false);
+        }
         return 0;
     }
     // b) Retired lease: redraw of a frame whose codec buffer was already
@@ -1205,6 +1317,11 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     int ridx = retired_find(p, mapper->src);
     if (ridx >= 0) {
         mapper_adopt_retired(mapper, ridx);
+        if (p->thermal.enabled) {
+            p->thermal.lease_reuse++;
+            p->thermal.pts = src_pts;
+            mks_thermal_report(&p->thermal, false);
+        }
         MP_INFO(mapper, "MKSURF: redraw adopt-retired pts=%.9f "
                         "retired=%d reaps=%"PRIu64"\n",
                 src_pts, p->retired_count, p->reap_count);
@@ -1292,6 +1409,7 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     if (lret != 0) {
         if (lret > 0) {
             p->latch_timeout_count++;
+            thermal_report_errors(p);
             MP_ERR(mapper, "MKSURF: latch timeout after %d ms (drop; "
                            "release_count=%"PRIu64" timeouts=%"PRIu64")\n",
                    latch_timeout_ms, p->release_count,
@@ -1305,6 +1423,8 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
         return -1;
     }
     p->latch_count++;
+    if (p->thermal.enabled)
+        p->thermal.latch = p->latch_count;
 
     // Latch timestamp sanity (the bridge reports ns): reject only the absurd
     // bound. 0 is a legal timestamp (first frame with PTS 0 passes); values
@@ -1313,6 +1433,7 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     // double. Either way this is treated as a latch failure.
     if (ts_ns >= (UINT64_C(1) << 53)) {
         p->latch_timeout_count++;
+        thermal_report_errors(p);
         MP_ERR(mapper, "MKSURF: latch-ts-invalid ts=%"PRIu64" (drop, counted "
                        "as latch failure; timeouts=%"PRIu64")\n",
                ts_ns, p->latch_timeout_count);
@@ -1346,6 +1467,7 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
                                              : MKSURF_STALE_FLOOR_S;
     if (delta > stale_threshold) {
         p->stale_drop_count++;
+        thermal_report_errors(p);
         MP_ERR(mapper, "MKSURF: stale-drop delta=%.6fs threshold=%.6fs "
                        "latch_ts=%"PRIu64" src_pts=%.9f (drop; "
                        "stale_drops=%"PRIu64")\n",
@@ -1356,9 +1478,21 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     int slot = take_slot(mapper);
     if (slot < 0)
         return -1;
-    if (!draw_copy(mapper, p->slots[slot].name, mapper->src_params.w,
-                   mapper->src_params.h))
+    GLuint dst_fbo = 0;
+    if (p->slot_fbo_reuse &&
+        !ra_gl_get_owned_fbo(mapper->ra, p->slots[slot].tex, &dst_fbo))
+        p->slot_fbo_fallbacks++;
+    // Read the FBO from the current texture on every new map, never cache a
+    // borrowed name across slot recreation. A getter refusal is a pre-draw
+    // fallback; a copy error must still fail this map without publishing or
+    // retrying the already consumed codec frame.
+    if (!draw_copy(mapper, p->slots[slot].name, dst_fbo, mapper->src_params.w,
+                   mapper->src_params.h, true, src_pts))
         return -1;
+    if (p->thermal.enabled) {
+        p->thermal.lease_copy++;
+        p->thermal.pts = src_pts;
+    }
 
 #if MKS_ST_DIAG_READBACK
     // Diagnostic readback, after the 2D copy completed and before publish.
@@ -1386,7 +1520,33 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     // A published lease must carry a fence; failure fails this map (the
     // frame stays consumed, no publish happens).
     if (p->have_fence) {
-        p->cur.fence = fence_create(mapper);
+        // Same-context work lets downstream submission reach this fence. This
+        // opt-in skips only the publish flush; unmap/wait/end flushes remain.
+        double nominal_fps = mapper->src->nominal_fps;
+        p->defer_publish_flush = mp_st_defer_publish(
+            p->flush_opts->publish_flush, nominal_fps, p->flush_override);
+        p->thermal.flush_policy = p->flush_opts->publish_flush;
+        p->thermal.flush_override = p->flush_override;
+        p->thermal.nominal_fps = nominal_fps;
+        p->thermal.defer_publish_flush = p->defer_publish_flush;
+        if ((p->thermal.enabled || p->flush_override >= 0) &&
+            !p->logged_flush_decision) {
+            p->logged_flush_decision = true;
+            MP_ERR(mapper, "MKS-FLUSH requested=%d effective=%d nominal_fps=%.9f "
+                           "experimental_override=%d\n",
+                   p->flush_opts->publish_flush, p->defer_publish_flush,
+                   nominal_fps, p->flush_override);
+        }
+        if (p->flush_override < 0 &&
+            p->flush_opts->publish_flush == MP_ST_PUBLISH_DEFER_30FPS &&
+            !mp_st_publish_fps_allowed(nominal_fps))
+            p->thermal.fps_fallback++;
+        bool flush_publish = !p->defer_publish_flush;
+        p->cur.fence = fence_create(mapper, flush_publish);
+        if (p->cur.fence && flush_publish)
+            p->publish_flush_count++;
+        p->thermal.publish_flush = p->publish_flush_count;
+        mks_thermal_report(&p->thermal, false);
         if (!p->cur.fence) {
             MP_ERR(mapper, "MKSURF: fence-create-failed at publish (drop; "
                            "failures=%"PRIu64")\n",
@@ -1423,7 +1583,10 @@ static void mapper_unmap(struct ra_hwdec_mapper *mapper)
     // until that sampling completed.
     fence_delete(mapper, &p->cur.fence);
     if (p->have_fence) {
-        p->cur.fence = fence_create(mapper);
+        p->cur.fence = fence_create(mapper, true);
+        if (p->cur.fence)
+            p->retire_flush_count++;
+        p->thermal.retire_flush = p->retire_flush_count;
         if (!p->cur.fence)
             MP_WARN(mapper, "MKSURF: fence-create-failed at retire; lease "
                             "retires unprotected (failures=%"PRIu64")\n",
@@ -1448,6 +1611,9 @@ static void mapper_uninit(struct ra_hwdec_mapper *mapper)
 {
     struct priv *p = mapper->priv;
     GL *gl = p->gl;
+    mks_gpu_timer_uninit(&p->gpu_copy_timer);
+    mks_thermal_report(&p->thermal, true);
+    slot_fbo_report(mapper, true);
 
     // Fences first, then textures (spec §2.9 ordering).
     if (p->have_fence)
@@ -1493,6 +1659,8 @@ static void mapper_uninit(struct ra_hwdec_mapper *mapper)
                     " release_failed=%"PRIu64" consumed_overflow=%"PRIu64
                     " horizon_overflow=%"PRIu64" idempotent_reacquires=%"PRIu64
                     " nonfinite_pts=%"PRIu64
+                    " defer_publish_flush=%d publish_flush=%"PRIu64
+                    " publish_deferred=%"PRIu64" retire_flush=%"PRIu64
                     " latches=%"PRIu64" timeouts=%"PRIu64
                     " stale_drops=%"PRIu64
                     " retires=%"PRIu64" reaps=%"PRIu64" reap_stuck=%"PRIu64
@@ -1501,6 +1669,8 @@ static void mapper_uninit(struct ra_hwdec_mapper *mapper)
             p->consumed_overflow_count,
             p->horizon_overflow_count, p->idempotent_reacquire_count,
             p->nonfinite_pts_count,
+            p->defer_publish_flush, p->publish_flush_count,
+            p->publish_deferred_count, p->retire_flush_count,
             p->latch_count, p->latch_timeout_count,
             p->stale_drop_count,
             p->retire_count, p->reap_count, p->reap_stuck_count,

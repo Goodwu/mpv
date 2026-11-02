@@ -1377,6 +1377,9 @@ static int decode_frame(struct mp_filter *vd)
         return ret;
     }
     mpi->params.dv_profile = ctx->codec->dv_profile;
+    mpi->params.dv_config_present = ctx->codec->dovi;
+    mpi->params.dv_bl_signal_compatibility_id =
+        ctx->codec->dv_bl_signal_compatibility_id;
 
     if (mpi->imgfmt == IMGFMT_CUDA && !mpi->planes[0]) {
         MP_ERR(vd, "CUDA frame without data. This is a FFmpeg bug.\n");

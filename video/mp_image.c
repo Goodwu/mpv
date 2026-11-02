@@ -873,6 +873,9 @@ bool mp_image_params_equal(const struct mp_image_params *p1,
            p1->p_w == p2->p_w && p1->p_h == p2->p_h &&
            p1->force_window == p2->force_window &&
            p1->dv_profile == p2->dv_profile &&
+           p1->dv_config_present == p2->dv_config_present &&
+           (!p1->dv_config_present || p1->dv_bl_signal_compatibility_id ==
+                                     p2->dv_bl_signal_compatibility_id) &&
            p1->hdr_vivid == p2->hdr_vivid &&
            p1->hdr10_plus == p2->hdr10_plus &&
            pl_color_space_equal(&p1->color, &p2->color) &&
@@ -1145,6 +1148,8 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
         struct mp_image_params *p = (void *)src->opaque_ref->data;
         dst->params.stereo3d = p->stereo3d;
         dst->params.dv_profile = p->dv_profile;
+        dst->params.dv_config_present = p->dv_config_present;
+        dst->params.dv_bl_signal_compatibility_id = p->dv_bl_signal_compatibility_id;
         // Might be incorrect if colorspace changes.
         dst->params.light = p->light;
 #if LIBAVUTIL_VERSION_INT < AV_VERSION_INT(60, 11, 100) || PL_API_VER < 356

@@ -6,6 +6,15 @@
 #include "video/csputils.h"
 
 #include "ra.h"
+#include "video/out/surfacetexture_flush.h"
+#include "video/out/yuv_frame_trace.h"
+
+// Separate from ra_ctx_conf: policy updates must not inherit UPDATE_VO.
+struct surfacetexture_opts {
+    int publish_flush;
+};
+
+extern const struct m_sub_options surfacetexture_conf;
 
 struct ra_ctx_opts {
     bool allow_sw;        // allow software renderers
@@ -33,6 +42,15 @@ struct ra_ctx {
     void *priv;
 };
 
+// Experimental render-only drawable; no GL object ownership is transferred.
+// Tokens are valid for exactly one draw in one surface generation.
+struct ra_yuv_fusion_target {
+    uint64_t token, generation;
+    int w, h;
+    unsigned framebuffer;
+    bool flipped;
+};
+
 // The functions that make up a ra_ctx.
 struct ra_ctx_fns {
     const char *type; // API type (for --gpu-api)
@@ -47,6 +65,18 @@ struct ra_ctx_fns {
     // Signal if the underlying context can use colorspace/hdr related functionality
     // on its own.
     bool (*pass_colorspace)(struct ra_ctx *ctx);
+
+    void (*yuv_frame_trace)(struct ra_ctx *ctx,
+                            const struct ra_yuv_fusion_target *target,
+                            const struct ra_yuv_frame_trace *frame);
+    void (*yuv_fusion_abort)(struct ra_ctx *ctx);
+    bool (*yuv_fusion_begin)(struct ra_ctx *ctx, struct ra_yuv_fusion_target *out);
+    void (*yuv_fusion_rgb_ready)(struct ra_ctx *ctx,
+                                  const struct ra_yuv_fusion_target *target,
+                                  bool rendered);
+    bool (*yuv_fusion_commit)(struct ra_ctx *ctx,
+                              const struct ra_yuv_fusion_target *target,
+                              bool rendered);
 
     // This behaves exactly like vo_driver.control().
     int (*control)(struct ra_ctx *ctx, int *events, int request, void *arg);

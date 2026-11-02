@@ -19,6 +19,8 @@
 #include <EGL/eglext.h>
 #include <dlfcn.h>
 #include <string.h>
+#include <math.h>
+#include <pthread.h>
 
 #include "video/out/android_common.h"
 #include "egl_helpers.h"
@@ -26,6 +28,9 @@
 #include "common/msg.h"
 #include "context.h"
 #include "utils.h"
+#include "mks_yuv_compare.h"
+#include "video/out/mks_thermal.h"
+#include "video/out/mks_gpu_timer.h"
 
 // ---------------------------------------------------------------------------
 // MKS YUV compile-time gate matrix (one block; every gate is
@@ -90,8 +95,47 @@
 // Like the policy above, these lines only emit when the failure or abnormal
 // state actually happens, so the off identity is unaffected.
 
+#ifndef GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS
+#define GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS 0x90DA
+#define GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS 0x90DD
+#define GL_MAX_SHADER_STORAGE_BLOCK_SIZE 0x90DE
+#define GL_SHADER_STORAGE_BUFFER_BINDING 0x90D3
+#define GL_BUFFER_UPDATE_BARRIER_BIT 0x00000200
+#endif
+
+struct mks_yuv_capture {
+    enum mks_yuv_compare_status status;
+    uint64_t id, generation;
+    struct mks_yuv_compare_roi roi;
+    GLuint program, buffer;
+    GLint tex_loc, roi_loc, binding;
+    GLsync fence;
+    void (GLAPIENTRY *uniform4i)(GLint, GLint, GLint, GLint, GLint);
+    uint32_t *words;
+    size_t num_words;
+    bool swap_succeeded, restore_attempted;
+    void (GLAPIENTRY *get_indexed)(GLenum, GLuint, GLint *);
+};
+
 struct priv {
     struct GL gl;
+    struct mks_yuv_capture capture;
+    pthread_t capture_owner_thread;
+    bool capture_owner_live;
+    struct mks_thermal_trace thermal;
+    struct mks_gpu_timer gpu_yuv_timer;
+    // Default-off experiment. Commit is consumed once, immediately at swap.
+    bool fusion_checked, fusion_enabled, fusion_committed, fusion_rgb_ready;
+    // Per-draw receipt bookkeeping for the swap gate (see yuv_fusion_begin).
+    bool fusion_begin_called, fusion_frame_engaged;
+    uint64_t fusion_generation, fusion_serial, fusion_pending;
+    uint64_t fusion_committed_generation, fusion_attempts, fusion_success;
+    uint64_t fusion_rgb_success, fusion_skipped_swap;
+    bool fusion_trace_enabled, fusion_trace_pending, fusion_trace_seen;
+    struct ra_yuv_frame_trace fusion_trace_frame, fusion_trace_previous;
+    uint64_t fusion_trace_token, fusion_trace_generation, fusion_trace_previous_generation;
+    bool fusion_trace_previous_fused;
+
     EGLDisplay egl_display;
     EGLContext egl_context;
     EGLSurface egl_surface;
@@ -305,6 +349,158 @@ static void yuv_diag_log_shader_log(struct ra_ctx *ctx, const char *what,
 // the rolled-back old texture stays attached for libplacebo's renders and
 // its GL name STAYS in p->yuv.tex (R3 fix: never orphaned) so the recovery
 // resize's success path or uninit deletes it exactly once.
+static void yuv_fusion_invalidate(struct priv *p)
+{
+    if (p->capture.id) p->capture.status = MKS_YUV_COMPARE_FAILED;
+    p->fusion_generation++;
+    p->fusion_pending = 0;
+    p->fusion_committed = false;
+    p->fusion_rgb_ready = false;
+    p->fusion_trace_pending = false;
+}
+
+static void android_yuv_fusion_abort(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv;
+    p->fusion_pending = 0;
+    p->fusion_committed = false;
+    p->fusion_rgb_ready = false;
+    p->fusion_trace_pending = false;
+}
+
+static bool android_yuv_fusion_begin(struct ra_ctx *ctx,
+                                     struct ra_yuv_fusion_target *out)
+{
+    struct priv *p = ctx->priv;
+    p->fusion_committed = false;
+    p->fusion_rgb_ready = false;
+    p->fusion_pending = 0;
+    p->fusion_trace_pending = false;
+    // Receipt bookkeeping for the swap gate: this draw called begin at all,
+    // and whether fusion engaged. A draw whose begin rejected (stale GL
+    // error, foreign surface, off) still renders the ordinary RGB offscreen
+    // fresh, so its swap must present through the ordinary final pass
+    // instead of being dropped as unreceipted.
+    p->fusion_begin_called = true;
+    p->fusion_frame_engaged = false;
+    if (!p->fusion_checked) {
+        char value[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.mks.yuv_fusion", value);
+        // Production default (2026-11-02, critical review approved): output
+        // fusion is on; debug.mks.yuv_fusion=0 restores the split path.
+        p->fusion_enabled = strcmp(value, "0") != 0;
+        memset(value, 0, sizeof(value));
+        __system_property_get("debug.mks.yuv_frame_trace", value);
+        p->fusion_trace_enabled = !strcmp(value, "1");
+        p->fusion_checked = true;
+    }
+    if ((!p->fusion_enabled && !p->fusion_trace_enabled) || !p->yuv_diag || !p->yuv.ready ||
+        p->yuv.w <= 1 || p->yuv.h <= 1 ||
+        eglGetCurrentContext() != p->egl_context ||
+        eglGetCurrentSurface(EGL_DRAW) != p->egl_surface)
+        return false;
+    // An existing GL error makes the experiment ineligible for this draw.
+    // Consume only in this explicitly enabled diagnostic path.
+    if (p->fusion_enabled && p->gl.GetError() != GL_NO_ERROR)
+        return false;
+    uint64_t token = ++p->fusion_serial;
+    p->fusion_frame_engaged = true;
+    p->fusion_pending = p->fusion_enabled ? token : 0;
+    *out = (struct ra_yuv_fusion_target) {
+        .token = token, .generation = p->fusion_generation,
+        .w = p->yuv.w, .h = p->yuv.h, .framebuffer = 0, .flipped = false,
+    };
+    if (p->fusion_enabled)
+        p->fusion_attempts++;
+    return p->fusion_enabled;
+}
+
+static void android_yuv_frame_trace(struct ra_ctx *ctx,
+                                    const struct ra_yuv_fusion_target *target,
+                                    const struct ra_yuv_frame_trace *frame)
+{
+    struct priv *p = ctx->priv;
+    if (!p->fusion_trace_enabled || !target->token ||
+        target->token != p->fusion_serial || target->generation != p->fusion_generation ||
+        !isfinite(frame->source_pts) || !isfinite(frame->current_pts))
+        return;
+    p->fusion_trace_frame = *frame;
+    p->fusion_trace_token = target->token;
+    p->fusion_trace_generation = target->generation;
+    p->fusion_trace_pending = true;
+}
+
+static void android_yuv_trace_swap(struct ra_ctx *ctx, bool swapped, bool fused)
+{
+    struct priv *p = ctx->priv;
+    if (!p->fusion_trace_pending)
+        return;
+    p->fusion_trace_pending = false;
+    if (!swapped || p->fusion_trace_generation != p->fusion_generation)
+        return;
+    const struct ra_yuv_frame_trace *f = &p->fusion_trace_frame;
+    const struct ra_yuv_frame_trace *last = &p->fusion_trace_previous;
+    bool changed = mp_yuv_frame_trace_should_emit(f, last, p->fusion_trace_seen,
+        fused != p->fusion_trace_previous_fused,
+        p->fusion_trace_generation != p->fusion_trace_previous_generation);
+    if (changed)
+        MP_ERR(ctx, "MKS-FUSION-FRAME event=swap-success route=%s pid=%ld instance=%p token=%"PRIu64" generation=%"PRIu64" frame_id=%"PRIu64" source_pts=%.9f current_pts=%.9f still=%d redraw=%d repeat=%d mono_ns=%"PRId64" gpu_draw_confirmed=%d\n",
+               fused ? "fused" : "rgb-final", (long)getpid(), p,
+               p->fusion_trace_token, p->fusion_trace_generation, f->frame_id,
+               f->source_pts, f->current_pts, f->still, f->redraw, f->repeat,
+               mp_time_ns(), fused);
+    p->fusion_trace_previous = *f;
+    p->fusion_trace_previous_fused = fused;
+    p->fusion_trace_previous_generation = p->fusion_trace_generation;
+    p->fusion_trace_seen = true;
+}
+
+static void android_yuv_fusion_rgb_ready(struct ra_ctx *ctx,
+                                         const struct ra_yuv_fusion_target *target,
+                                         bool rendered)
+{
+    struct priv *p = ctx->priv;
+    p->fusion_committed = false;
+    p->fusion_rgb_ready = rendered && p->fusion_pending &&
+        target->token == p->fusion_pending && target->token == p->fusion_serial &&
+        target->generation == p->fusion_generation && p->yuv.ready &&
+        target->w == p->yuv.w && target->h == p->yuv.h &&
+        eglGetCurrentContext() == p->egl_context &&
+        eglGetCurrentSurface(EGL_DRAW) == p->egl_surface;
+    p->fusion_pending = 0;
+    p->fusion_committed_generation = p->fusion_generation;
+    if (p->fusion_rgb_ready) {
+        p->fusion_rgb_success++;
+        if (p->fusion_rgb_success == 1 || p->fusion_rgb_success % 300 == 0)
+            MP_ERR(ctx, "MKS-FUSION rgb-fresh=%"PRIu64" generation=%"PRIu64"\n",
+                   p->fusion_rgb_success, p->fusion_generation);
+    }
+}
+
+static bool android_yuv_fusion_commit(struct ra_ctx *ctx,
+                                      const struct ra_yuv_fusion_target *target,
+                                      bool rendered)
+{
+    struct priv *p = ctx->priv;
+    bool current = p->fusion_pending && target->token == p->fusion_pending &&
+        target->generation == p->fusion_generation &&
+        target->w == p->yuv.w && target->h == p->yuv.h && p->yuv.ready &&
+        eglGetCurrentContext() == p->egl_context &&
+        eglGetCurrentSurface(EGL_DRAW) == p->egl_surface;
+    bool no_error = current && p->gl.GetError() == GL_NO_ERROR;
+    p->fusion_committed = current && rendered && no_error;
+    if (p->fusion_committed || !current)
+        p->fusion_pending = 0;
+    p->fusion_committed_generation = p->fusion_generation;
+    if (p->fusion_committed) {
+        p->fusion_success++;
+        if (p->fusion_success == 1 || p->fusion_success % 300 == 0)
+            MP_ERR(ctx, "MKS-FUSION committed=%"PRIu64" attempted=%"PRIu64" generation=%"PRIu64"\n",
+                   p->fusion_success, p->fusion_attempts, p->fusion_generation);
+    }
+    return p->fusion_committed;
+}
+
 static bool yuv_diag_ensure_offscreen(struct ra_ctx *ctx, int w, int h)
 {
     struct priv *p = ctx->priv;
@@ -317,6 +513,8 @@ static bool yuv_diag_ensure_offscreen(struct ra_ctx *ctx, int w, int h)
     }
     if (p->yuv.fbo && p->yuv.w == w && p->yuv.h == h)
         return true;
+
+    yuv_fusion_invalidate(p);
 
     // Keep the previous texture alive until the new attachment is complete.
     GLuint old_tex = p->yuv.tex;
@@ -388,6 +586,230 @@ static bool yuv_diag_ensure_offscreen(struct ra_ctx *ctx, int w, int h)
     p->yuv.ready = p->yuv.program != 0;
     MP_ERR(ctx, "YUV-DIAG: offscreen RGB FBO ready (%dx%d, rgba16f)\n", w, h);
     return true;
+}
+
+
+// Explicit diagnostic transaction only. Never arms from the property alone.
+static bool yuv_capture_current(struct priv *p)
+{
+    return mks_yuv_compare_context_matches((uintptr_t)p->egl_context,
+        (uintptr_t)p->egl_surface, (uintptr_t)eglGetCurrentContext(),
+        (uintptr_t)eglGetCurrentSurface(EGL_DRAW));
+}
+
+bool mks_android_yuv_compare_owner_current(struct ra_ctx *ctx)
+{
+    extern const struct ra_ctx_fns ra_ctx_android;
+    if (!ctx || ctx->fns != &ra_ctx_android) return false;
+    struct priv *p = ctx->priv;
+    return p->capture_owner_live && p->egl_display != EGL_NO_DISPLAY &&
+        eglGetCurrentDisplay() == p->egl_display &&
+        eglGetCurrentSurface(EGL_READ) == p->egl_surface && yuv_capture_current(p);
+}
+
+bool mks_android_yuv_compare_restore_owner(struct ra_ctx *ctx)
+{
+    extern const struct ra_ctx_fns ra_ctx_android;
+    if (!ctx || ctx->fns != &ra_ctx_android) return false;
+    struct priv *p = ctx->priv;
+    struct mks_yuv_capture *c = &p->capture;
+    // This is not a general context binding API. Only an explicitly armed
+    // diagnostic on its original VO thread may attempt a single restoration.
+    if (!mks_yuv_compare_restore_allowed(c->id, c->restore_attempted,
+        p->capture_owner_live, p->capture_owner_live &&
+        pthread_equal(pthread_self(), p->capture_owner_thread))) return false;
+    c->restore_attempted = true;
+    c->status = MKS_YUV_COMPARE_FAILED;
+    p->fusion_trace_pending = false;
+    p->fusion_committed = false;
+    p->fusion_rgb_ready = false;
+    p->fusion_pending = 0;
+    if (p->egl_display == EGL_NO_DISPLAY || p->egl_context == EGL_NO_CONTEXT ||
+        p->egl_surface == EGL_NO_SURFACE) return false;
+    // Query only the currently live context-owned handles. Do not restore the
+    // surface/generation captured when arm() ran: resize may have replaced it.
+    EGLint version = 0, width = 0, height = 0;
+    if (!eglQueryContext(p->egl_display, p->egl_context,
+                         EGL_CONTEXT_CLIENT_VERSION, &version) ||
+        !eglQuerySurface(p->egl_display, p->egl_surface, EGL_WIDTH, &width) ||
+        !eglQuerySurface(p->egl_display, p->egl_surface, EGL_HEIGHT, &height) ||
+        width <= 0 || height <= 0) return false;
+    if (!eglMakeCurrent(p->egl_display, p->egl_surface, p->egl_surface,
+                        p->egl_context)) return false;
+    return mks_android_yuv_compare_owner_current(ctx);
+}
+
+bool mks_android_yuv_compare_current(struct ra_ctx *ctx, uint64_t id,
+                                     uint64_t generation)
+{
+    extern const struct ra_ctx_fns ra_ctx_android;
+    if (!ctx || ctx->fns != &ra_ctx_android || !id)
+        return false;
+    const struct priv *p = ctx->priv;
+    return p->capture.id == id && p->capture.generation == generation &&
+           p->fusion_generation == generation && p->capture.status != MKS_YUV_COMPARE_IDLE &&
+           mks_android_yuv_compare_owner_current(ctx);
+}
+
+void mks_android_yuv_compare_cancel(struct ra_ctx *ctx)
+{
+    extern const struct ra_ctx_fns ra_ctx_android;
+    if (!ctx || ctx->fns != &ra_ctx_android)
+        return;
+    struct priv *p = ctx->priv;
+    struct mks_yuv_capture *c = &p->capture;
+    if (!c->id && !c->buffer && !c->program && !c->words) return;
+    if (!yuv_capture_current(p)) {
+        c->status = MKS_YUV_COMPARE_FAILED;
+        return; // Do not delete names in a foreign GL context.
+    }
+    if (c->fence) p->gl.DeleteSync(c->fence);
+    if (c->buffer) p->gl.DeleteBuffers(1, &c->buffer);
+    if (c->program) p->gl.DeleteProgram(c->program);
+    talloc_free(c->words);
+    *c = (struct mks_yuv_capture){0};
+}
+
+static bool yuv_capture_program(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv;
+    struct GL *gl = &p->gl;
+    struct mks_yuv_capture *c = &p->capture;
+    char *fs_src = talloc_asprintf(NULL,
+        "#version 310 es\n#extension GL_EXT_YUV_target : require\n"
+        "precision highp float; precision highp int;\n"
+        "uniform highp sampler2D mksSrc; uniform ivec4 mksRoi;\n"
+        "layout(std430,binding=%d) buffer MksCapture { uint words[]; };\n"
+        "layout(yuv) out highp vec3 mksColor;\n"
+        "void main() {\n"
+        "vec3 rgb=texelFetch(mksSrc,ivec2(gl_FragCoord.xy),0).rgb;\n"
+        "float y=0.2627*rgb.r+0.6780*rgb.g+0.0593*rgb.b;\n"
+        "float cb=(rgb.b-y)*0.5/(1.0-0.0593);\n"
+        "float cr=(rgb.r-y)*0.5/(1.0-0.2627);\n"
+        "mksColor=vec3(y,cb+0.5,cr+0.5);\n"
+        "ivec2 q=ivec2(gl_FragCoord.xy)-mksRoi.xy;\n"
+        "if(all(greaterThanEqual(q,ivec2(0))) && all(lessThan(q,mksRoi.zw))) {\n"
+        "uint i=uint(q.y*mksRoi.z+q.x)*7u;\n"
+        "uint n=atomicAdd(words[i],1u); if(n==0u) {\n"
+        "words[i+1u]=floatBitsToUint(rgb.r);words[i+2u]=floatBitsToUint(rgb.g);"
+        "words[i+3u]=floatBitsToUint(rgb.b);\n"
+        "words[i+4u]=floatBitsToUint(mksColor.r);words[i+5u]=floatBitsToUint(mksColor.g);"
+        "words[i+6u]=floatBitsToUint(mksColor.b); } } }\n", c->binding);
+    GLuint vs = gl->CreateShader(GL_VERTEX_SHADER);
+    GLuint fs = gl->CreateShader(GL_FRAGMENT_SHADER);
+    const char *vs_src =
+        "#version 310 es\nvoid main(){float x=float((gl_VertexID&1)<<2)-1.0;"
+        "float y=float((gl_VertexID&2)<<1)-1.0;gl_Position=vec4(x,y,0,1);}";
+    gl->ShaderSource(vs, 1, &vs_src, NULL);
+    gl->ShaderSource(fs, 1, (const char **)&fs_src, NULL);
+    gl->CompileShader(vs); gl->CompileShader(fs);
+    GLint vok = 0, fok = 0, linked = 0;
+    gl->GetShaderiv(vs, GL_COMPILE_STATUS, &vok);
+    gl->GetShaderiv(fs, GL_COMPILE_STATUS, &fok);
+    if (!vok) yuv_diag_log_shader_log(ctx, "capture VS", vs, gl->GetShaderInfoLog);
+    if (!fok) yuv_diag_log_shader_log(ctx, "capture FS", fs, gl->GetShaderInfoLog);
+    if (vok && fok) {
+        c->program = gl->CreateProgram();
+        gl->AttachShader(c->program, vs); gl->AttachShader(c->program, fs);
+        gl->LinkProgram(c->program);
+        gl->GetProgramiv(c->program, GL_LINK_STATUS, &linked);
+        if (!linked) yuv_diag_log_shader_log(ctx, "capture link", c->program,
+                                             gl->GetProgramInfoLog);
+    }
+    gl->DeleteShader(vs); gl->DeleteShader(fs); talloc_free(fs_src);
+    if (!linked || gl->GetError() != GL_NO_ERROR) return false;
+    c->tex_loc = gl->GetUniformLocation(c->program, "mksSrc");
+    c->roi_loc = gl->GetUniformLocation(c->program, "mksRoi");
+    return c->tex_loc >= 0 && c->roi_loc >= 0;
+}
+
+bool mks_android_yuv_compare_arm(struct ra_ctx *ctx, uint64_t id,
+                               uint64_t generation, struct mks_yuv_compare_roi roi)
+{
+    extern const struct ra_ctx_fns ra_ctx_android;
+    if (!ctx || ctx->fns != &ra_ctx_android) return false;
+    struct priv *p = ctx->priv;
+    struct GL *gl = &p->gl;
+    char enabled[PROP_VALUE_MAX] = {0};
+    __system_property_get("debug.mks.yuv_compare", enabled);
+    char timing[PROP_VALUE_MAX] = {0};
+    __system_property_get("debug.mks.gpu_timing", timing);
+    if (strcmp(enabled, "1") || (timing[0] && strcmp(timing, "0")) ||
+        !id || !p->fusion_enabled || !p->yuv_diag || !p->yuv.ready ||
+        generation != p->fusion_generation || !yuv_capture_current(p) ||
+        p->capture.status != MKS_YUV_COMPARE_IDLE || roi.w <= 0 || roi.h <= 0 ||
+        roi.w > 256 || roi.h > 256 || roi.x < 0 || roi.y < 0 ||
+        roi.x > p->yuv.w - roi.w || roi.y > p->yuv.h - roi.h ||
+        gl->es < 310 || !gl->BindBufferBase || !gl->MapBufferRange ||
+        !gl->MemoryBarrier || !gl->FenceSync || !gl->ClientWaitSync ||
+        gl->GetError() != GL_NO_ERROR) return false;
+    struct mks_yuv_capture *c = &p->capture;
+    c->id = id; c->generation = generation; c->roi = roi;
+    c->status = MKS_YUV_COMPARE_FAILED;
+    c->get_indexed = (void *)eglGetProcAddress("glGetIntegeri_v");
+    c->uniform4i = (void *)eglGetProcAddress("glUniform4i");
+    GLint blocks = 0, bindings = 0, max_bytes = 0;
+    gl->GetIntegerv(GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS, &blocks);
+    gl->GetIntegerv(GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS, &bindings);
+    gl->GetIntegerv(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &max_bytes);
+    c->num_words = (size_t)roi.w * roi.h * 7;
+    if (!c->get_indexed || !c->uniform4i || blocks < 1 || bindings < 1 ||
+        max_bytes <= 0 || (size_t)max_bytes < c->num_words * sizeof(uint32_t) ||
+        gl->GetError() != GL_NO_ERROR) return false;
+    c->binding = bindings - 1;
+    GLint indexed_buffer = -1;
+    c->get_indexed(GL_SHADER_STORAGE_BUFFER_BINDING, c->binding, &indexed_buffer);
+    if (!mks_yuv_compare_binding_idle(indexed_buffer) ||
+        gl->GetError() != GL_NO_ERROR) return false;
+    c->words = talloc_zero_array(NULL, uint32_t, c->num_words);
+    if (!c->words || !yuv_capture_program(ctx)) return false;
+    GLint prev = 0; gl->GetIntegerv(GL_SHADER_STORAGE_BUFFER_BINDING, &prev);
+    gl->GenBuffers(1, &c->buffer); gl->BindBuffer(GL_SHADER_STORAGE_BUFFER, c->buffer);
+    gl->BufferData(GL_SHADER_STORAGE_BUFFER, c->num_words * sizeof(uint32_t),
+                   c->words, GL_DYNAMIC_READ);
+    gl->BindBuffer(GL_SHADER_STORAGE_BUFFER, prev);
+    if (!c->buffer || gl->GetError() != GL_NO_ERROR) return false;
+    c->status = MKS_YUV_COMPARE_ARMED;
+    return true;
+}
+
+enum mks_yuv_compare_status mks_android_yuv_compare_poll(
+    struct ra_ctx *ctx, struct mks_yuv_compare_result *out)
+{
+    extern const struct ra_ctx_fns ra_ctx_android;
+    if (!ctx || ctx->fns != &ra_ctx_android || !out) return MKS_YUV_COMPARE_FAILED;
+    struct priv *p = ctx->priv; struct mks_yuv_capture *c = &p->capture;
+    struct GL *gl = &p->gl;
+    if (c->status == MKS_YUV_COMPARE_PENDING) {
+        if (!yuv_capture_current(p) || c->generation != p->fusion_generation) {
+            c->status = MKS_YUV_COMPARE_FAILED;
+        } else {
+            GLenum ready = gl->ClientWaitSync(c->fence, 0, 0);
+            if (ready == GL_WAIT_FAILED) c->status = MKS_YUV_COMPARE_FAILED;
+            if (ready == GL_ALREADY_SIGNALED || ready == GL_CONDITION_SATISFIED) {
+                GLint prev = 0; gl->GetIntegerv(GL_SHADER_STORAGE_BUFFER_BINDING, &prev);
+                gl->BindBuffer(GL_SHADER_STORAGE_BUFFER, c->buffer);
+                void *data = gl->MapBufferRange(GL_SHADER_STORAGE_BUFFER, 0,
+                    c->num_words * sizeof(uint32_t), GL_MAP_READ_BIT);
+                bool ok = data != NULL;
+                if (data) { memcpy(c->words, data, c->num_words * sizeof(uint32_t));
+                            ok = gl->UnmapBuffer(GL_SHADER_STORAGE_BUFFER); }
+                gl->BindBuffer(GL_SHADER_STORAGE_BUFFER, prev);
+                ok = ok && gl->GetError() == GL_NO_ERROR;
+                for (size_t i = 0; ok && i < c->num_words; i += 7) {
+                    ok = c->words[i] == 1;
+                    for (size_t k = 1; ok && k < 7; k++)
+                        ok = (c->words[i+k] & 0x7f800000u) != 0x7f800000u;
+                }
+                c->status = ok ? MKS_YUV_COMPARE_READY : MKS_YUV_COMPARE_FAILED;
+            }
+        }
+    }
+    *out = (struct mks_yuv_compare_result) { .capture_id = c->id,
+        .generation = c->generation, .roi = c->roi, .status = c->status,
+        .words = c->status == MKS_YUV_COMPARE_READY ? c->words : NULL,
+        .num_words = c->num_words, .swap_succeeded = c->swap_succeeded };
+    return c->status;
 }
 
 // Compile/link the final pass. Any failure is a hard open failure.
@@ -504,11 +926,50 @@ static void yuv_diag_final_pass(struct ra_ctx *ctx)
     gl->Disable(GL_BLEND);
     gl->Disable(GL_DEPTH_TEST);
     gl->Disable(GL_SCISSOR_TEST);
-    gl->UseProgram(p->yuv.program);
+    struct mks_yuv_capture *capture = &p->capture;
+    bool capturing = capture->status == MKS_YUV_COMPARE_ARMED &&
+                     capture->generation == p->fusion_generation;
+    GLint prev_ssbo = 0, prev_indexed_ssbo = 0;
+    if (capturing) {
+        gl->GetIntegerv(GL_SHADER_STORAGE_BUFFER_BINDING, &prev_ssbo);
+        capture->get_indexed(GL_SHADER_STORAGE_BUFFER_BINDING, capture->binding,
+                             &prev_indexed_ssbo);
+        // Do not replace a pre-existing range. Binding=0 has no START/SIZE
+        // state to lose, and is the only state this diagnostic accepts.
+        if (!mks_yuv_compare_binding_idle(prev_indexed_ssbo) ||
+            gl->GetError() != GL_NO_ERROR) {
+            capture->status = MKS_YUV_COMPARE_FAILED;
+            capturing = false;
+        } else {
+            gl->BindBufferBase(GL_SHADER_STORAGE_BUFFER, capture->binding,
+                               capture->buffer);
+        }
+    }
+    gl->UseProgram(capturing ? capture->program : p->yuv.program);
     gl->ActiveTexture(GL_TEXTURE0);
     gl->BindTexture(GL_TEXTURE_2D, p->yuv.tex);
-    gl->Uniform1i(p->yuv.tex_loc, 0);
+    gl->Uniform1i(capturing ? capture->tex_loc : p->yuv.tex_loc, 0);
+    if (capturing)
+        capture->uniform4i(capture->roi_loc, capture->roi.x, capture->roi.y,
+                            capture->roi.w, capture->roi.h);
+    bool timed = mks_gpu_timer_begin(&p->gpu_yuv_timer, gl, ctx->log,
+                                     "final-yuv", NAN);
     gl->DrawArrays(GL_TRIANGLES, 0, 3);
+    mks_gpu_timer_end(&p->gpu_yuv_timer, timed);
+    if (capturing) {
+        gl->MemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+        capture->fence = gl->FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        gl->Flush(); // Diagnostic readback progress; excluded from performance tests.
+        gl->BindBufferBase(GL_SHADER_STORAGE_BUFFER, capture->binding, prev_indexed_ssbo);
+        gl->BindBuffer(GL_SHADER_STORAGE_BUFFER, prev_ssbo);
+        capture->status = capture->fence && gl->GetError() == GL_NO_ERROR
+                        ? MKS_YUV_COMPARE_PENDING : MKS_YUV_COMPARE_FAILED;
+    }
+    if (p->thermal.enabled) {
+        p->thermal.final_pass++;
+        p->thermal.w = p->yuv.w;
+        p->thermal.h = p->yuv.h;
+    }
 
 #if MKS_YUV_P0_OBSERVE
     // b: bounded GL error observation — GetError also clears the flag, so it
@@ -546,6 +1007,8 @@ static void yuv_diag_final_pass(struct ra_ctx *ctx)
         else
             gl->Disable(GL_SCISSOR_TEST);
     }
+    if (capturing && gl->GetError() != GL_NO_ERROR)
+        capture->status = MKS_YUV_COMPARE_FAILED;
 }
 
 // Public hook for gpu_next/context.c: the FBO the libplacebo swapchain must
@@ -1257,7 +1720,50 @@ static void android_swap_buffers(struct ra_ctx *ctx)
     // MKS YUV diag: final layout(yuv) pass from the RGB offscreen into the
     // YUV default framebuffer, immediately before the commit. Inert when the
     // branch is off (ready stays false).
-    yuv_diag_final_pass(ctx);
+    bool current = p->fusion_committed_generation == p->fusion_generation;
+    bool fused = p->fusion_committed && current;
+    bool fresh_rgb = p->fusion_rgb_ready && current;
+    p->fusion_committed = false;
+    p->fusion_rgb_ready = false;
+    p->fusion_pending = 0;
+    // A fused frame leaves the RGB offscreen stale. An extra flip after a
+    // failed start_frame must retain the displayed buffer, not replay it.
+    // Two distinct unreceipted cases: begin engaged but neither commit nor
+    // rgb-fresh arrived (mid-frame breakage — keep skipping), and a flip
+    // whose draw never called begin at all (extra flip after a failed
+    // start_frame — keep skipping). A draw whose begin REJECTED rendered
+    // the ordinary RGB offscreen fresh, so that swap presents normally.
+    if (p->fusion_enabled && p->yuv_diag && !fused && !fresh_rgb &&
+        (!p->fusion_begin_called || p->fusion_frame_engaged)) {
+        p->fusion_trace_pending = false;
+        p->fusion_skipped_swap++;
+        if (p->fusion_skipped_swap == 1 || p->fusion_skipped_swap % 300 == 0)
+            MP_ERR(ctx, "MKS-FUSION skipped-unfresh-swap=%"PRIu64"\n",
+                   p->fusion_skipped_swap);
+        p->fusion_begin_called = false;
+        p->fusion_frame_engaged = false;
+        return;
+    }
+    p->fusion_begin_called = false;
+    p->fusion_frame_engaged = false;
+    if (p->capture.id && !yuv_capture_current(p)) {
+        p->capture.status = MKS_YUV_COMPARE_FAILED;
+        p->fusion_trace_pending = false;
+        return; // No GL calls or swap may run against a replacement context/surface.
+    }
+    if (p->capture.id && (fused || !fresh_rgb ||
+        p->capture.generation != p->fusion_generation ||
+        p->capture.status != MKS_YUV_COMPARE_ARMED)) {
+        p->capture.status = MKS_YUV_COMPARE_FAILED;
+        p->fusion_trace_pending = false;
+        return; // Never present preliminary B or a failed diagnostic transaction.
+    }
+    if (!fused)
+        yuv_diag_final_pass(ctx);
+    if (p->capture.id && p->capture.status != MKS_YUV_COMPARE_PENDING) {
+        p->fusion_trace_pending = false;
+        return;
+    }
     // Swap-path error policy (gate matrix at the top of this file): a swap
     // with the final pass down is never skipped, only logged, and an
     // eglSwapBuffers failure never changes this void path.
@@ -1267,7 +1773,18 @@ static void android_swap_buffers(struct ra_ctx *ctx)
             MP_ERR(ctx, "YUV-DIAG: swap with final-pass ready=false (#%d); "
                    "committing without the final pass\n", p->yuv.notready_swaps);
     }
-    if (!eglSwapBuffers(p->egl_display, p->egl_surface)) {
+    bool swapped = eglSwapBuffers(p->egl_display, p->egl_surface);
+    if (p->capture.id) {
+        p->capture.swap_succeeded = swapped;
+        if (!swapped) p->capture.status = MKS_YUV_COMPARE_FAILED;
+    }
+    android_yuv_trace_swap(ctx, swapped, fused);
+    if (p->thermal.enabled) {
+        p->thermal.swap++;
+        p->thermal.swap_ok += swapped;
+        mks_thermal_report(&p->thermal, false);
+    }
+    if (!swapped) {
         p->swap_failures++;
         if (mks_fail_log_now(p->swap_failures))
             MP_ERR(ctx, "YUV-SWAP: eglSwapBuffers failed (error=0x%x, failure "
@@ -1285,6 +1802,11 @@ static void android_swap_buffers(struct ra_ctx *ctx)
 static void android_uninit(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
+    p->capture_owner_live = false;
+    yuv_fusion_invalidate(p);
+    mks_android_yuv_compare_cancel(ctx);
+    mks_gpu_timer_uninit(&p->gpu_yuv_timer);
+    mks_thermal_report(&p->thermal, true);
     // Hook teardown: restore the producer entry points at the context
     // teardown boundary (the hook lives for the context lifetime).
 #if MKS_YUV_HOOK
@@ -1312,6 +1834,7 @@ static void android_uninit(struct ra_ctx *ctx)
 static bool android_init(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
+    mks_thermal_init(&p->thermal, ctx->log, "yuv", p);
 
     if (!vo_android_init(ctx->vo))
         goto fail;
@@ -1416,6 +1939,8 @@ static bool android_init(struct ra_ctx *ctx)
     }
     if (p->yuv_diag)
         MP_ERR(ctx, "YUV-DIAG: eglMakeCurrent ok\n");
+    p->capture_owner_thread = pthread_self();
+    p->capture_owner_live = true;
 
     // Producer-callback hook: after the window surface exists and the
     // context is bound, before the first frame - install the passthrough
@@ -1475,6 +2000,22 @@ static bool android_reconfig(struct ra_ctx *ctx)
     int w, h;
     if (!vo_android_surface_size(ctx->vo, &w, &h))
         return false;
+    {
+        // Diagnostic-only transition harness: when the controlled-transition
+        // property is armed, the VO-level injector's dwidth/dheight are the
+        // authoritative reconfig size, letting a live session resize the
+        // whole chain (native window + YUV wrapper + RA swapchain) exactly
+        // as a real surface change would. Default 0 keeps the surface size.
+        char transition[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.mks.yuv_table_transition", transition);
+        int delta = atoi(transition);
+        if (delta && ctx->vo->dwidth && ctx->vo->dheight) {
+            MP_ERR(ctx, "MKS-FUSION-TABLE event=transition-reconfig surface=%dx%d override=%dx%d\n",
+                   w, h, ctx->vo->dwidth, ctx->vo->dheight);
+            w = ctx->vo->dwidth;
+            h = ctx->vo->dheight;
+        }
+    }
 
     // MKS YUV diag: absorb transient placeholder resizes (the Dart binding
     // emits 1x1 until the video rect is known). The previously initialized
@@ -1520,6 +2061,11 @@ const struct ra_ctx_fns ra_ctx_android = {
     .name           = "android",
     .description    = "Android/EGL",
     .reconfig       = android_reconfig,
+    .yuv_fusion_begin = android_yuv_fusion_begin,
+    .yuv_frame_trace = android_yuv_frame_trace,
+    .yuv_fusion_abort = android_yuv_fusion_abort,
+    .yuv_fusion_commit = android_yuv_fusion_commit,
+    .yuv_fusion_rgb_ready = android_yuv_fusion_rgb_ready,
     .control        = android_control,
     .init           = android_init,
     .uninit         = android_uninit,

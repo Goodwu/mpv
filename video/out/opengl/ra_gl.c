@@ -482,6 +482,24 @@ void ra_gl_get_raw_tex(struct ra *ra, struct ra_tex *tex,
     *out_target = tex_gl->target;
 }
 
+bool ra_gl_get_owned_fbo(struct ra *ra, struct ra_tex *tex, GLuint *out_fbo)
+{
+    if (!out_fbo)
+        return false;
+    *out_fbo = 0;
+    if (!ra || !ra_is_gl(ra) || !tex || !tex->priv ||
+        !tex->params.render_dst || tex->params.dimensions != 2)
+        return false;
+    struct ra_tex_gl *tex_gl = tex->priv;
+    // gl_tex_create checked this attachment's completeness. Only its RA-owned
+    // FBO is eligible; raw/wrapped names may have unrelated attachment state.
+    if (!tex_gl->own_objects || tex_gl->target != GL_TEXTURE_2D ||
+        !tex_gl->texture || !tex_gl->fbo)
+        return false;
+    *out_fbo = tex_gl->fbo;
+    return true;
+}
+
 // Return whether the ra instance was created with ra_create_gl(). This is the
 // _only_ function that can be called on a ra instance of any type.
 bool ra_is_gl(struct ra *ra)

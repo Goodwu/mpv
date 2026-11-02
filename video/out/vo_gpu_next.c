@@ -18,6 +18,8 @@
  */
 
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <time.h>
 
 #include <libplacebo/colorspace.h>
@@ -48,9 +50,19 @@
 #include "gpu/video_shaders.h"
 #include "sub/osd.h"
 #include "gpu_next/context.h"
+#include "mks_thermal.h"
+#include "yuv_fusion_gate.h"
+#include "yuv_compare_vo.h"
+#include "yuv_atlas_anchor.h"
+#include "yuv_atlas_read.h"
+#include "opengl/mks_yuv_compare.h"
 
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
 #include <libplacebo/opengl.h>
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+#include <libavutil/sha.h>
+#include <libavutil/mem.h>
+#endif
 #include "video/out/opengl/ra_gl.h"
 #endif
 
@@ -104,6 +116,7 @@ struct cache {
 
 struct priv {
     struct mp_log *log;
+    struct mks_thermal_trace thermal;
     struct mpv_global *global;
     struct ra_ctx *ra_ctx;
     struct gpu_ctx *context;
@@ -120,6 +133,78 @@ struct priv {
     pl_renderer rr;
     pl_queue queue;
     pl_swapchain sw;
+    pl_tex fusion_target;
+    uint64_t fusion_generation;
+    uint64_t fusion_gate_rejects, fusion_draw_failures;
+    bool fusion_presentation_guard, fusion_disabled, fusion_fault_fired;
+    bool fusion_frame_trace;
+    bool compare_requested, compare_enabled, compare_repeat, compare_sample_tap;
+    bool compare_invariant_b;
+    bool compare_uv_oracle, compare_uv_oracle_use_a;
+    bool compare_uv_probe;
+    bool compare_uv_single;
+    bool compare_quad_order, compare_quad_reverse;
+    bool compare_atlas, atlas_reuse;
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(PL_HAVE_MKS_UV_ATLAS_ANCHOR)
+    pl_opengl_uv_atlas_anchor atlas_anchor;
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+    pl_opengl_uv_atlas_cache atlas_cache;
+    pl_opengl_uv_atlas_read atlas_read;
+    struct pl_opengl_uv_atlas_cache_info atlas_cache_info;
+    enum mp_yuv_atlas_read_phase atlas_phase;
+    unsigned int atlas_ordinal;
+    double atlas_second_pts, atlas_seed_pts;
+    uint64_t atlas_seed_id, atlas_seed_frame_id, atlas_seed_frame_token;
+    uint64_t atlas_seed_image, atlas_input_image;
+    uint64_t atlas_renderer_id, atlas_renderer_generation;
+    char atlas_nonce[33], atlas_seed_manifest[128], atlas_seed_sha[65], atlas_signature[65];
+    bool atlas_wait_expired;
+#endif
+#endif
+    // Default-off production UV table for the output fusion candidate:
+    // OFF -> SEEDING (ordinary path renders while a zero-readback anchor
+    // records the validated UV table) -> READY (table attached; generated
+    // fusion final passes sample through it). Any failure returns to OFF and
+    // the ordinary path; the displayed frame is never a table experiment.
+    bool fusion_table_enabled;
+    // True when the table property was set at init: production mode pairs
+    // fusion with the table, so losing the table must also stop fusing
+    // instead of silently reverting to the un-tabled (quality-regressing)
+    // fusion path. An explicit table-off config keeps plain fusion.
+    bool fusion_table_was_enabled;
+    enum { FT_OFF, FT_SEEDING, FT_READY } fusion_table_state;
+    pl_opengl_uv_atlas_anchor table_anchor;
+    pl_opengl_uv_atlas_cache table_cache;
+    uint64_t table_serial;
+    int table_seed_frames, table_failures;
+    // Consumer-side budget: fused-frame failures after a READY table. NOT
+    // reset by a successful seed — only a successfully committed fused frame
+    // proves recovery — so a seed/fail loop cannot spin forever.
+    int table_consume_failures;
+    // Controlled transition harness (diagnostic property
+    // debug.mks.yuv_table_transition=<delta>): applies a REAL VO-level
+    // resize (dwidth/dheight + resize(vo) -> reconfig chain) so a READY
+    // table meets a live geometry change. Default 0 = never active.
+    int table_transition_delta;
+    // Seed-time identity snapshot: the table is only valid for this exact
+    // source geometry + scaler selection. Any later drift detaches it.
+    int table_src_w, table_src_h;
+    int table_scaler_kernel, table_dscale_kernel;
+    bool table_linear_up, table_linear_down, table_correct_down;
+    bool compare_started, compare_active, compare_a_ready;
+    bool compare_terminal, compare_fatal_context, compare_frame_open;
+    double compare_target_pts, compare_source_pts, compare_current_pts;
+    int compare_width, compare_height;
+    uint64_t compare_id, compare_generation, compare_error_epoch;
+    uint64_t compare_frame_id, compare_frame_token;
+    bool compare_epoch_valid;
+    int compare_x, compare_y, compare_w, compare_h;
+    int64_t compare_deadline;
+    uint32_t *compare_words;
+    size_t compare_num_words;
+    uint32_t *compare_probe_words;
+    size_t compare_num_probe_words;
+    int fusion_fault; // explicit one-shot diagnostics: 1=commit, 2=GL error
     pl_fmt osd_fmt[SUBBITMAP_COUNT];
     pl_tex *sub_tex;
     int num_sub_tex;
@@ -156,6 +241,12 @@ struct priv {
     // Performance data of last frame
     struct frame_info perf_fresh;
     struct frame_info perf_redraw;
+
+    // Opt-in snapshots of libplacebo's asynchronous GPU timing histories.
+    bool gpu_timing;
+    int64_t gpu_timing_next_ns;
+    uint64_t gpu_timing_frame_id;
+    double gpu_timing_pts;
 
     struct mp_image_params target_params;
 };
@@ -824,6 +915,42 @@ static void info_callback(void *priv, const struct pl_render_info *info)
     pl_dispatch_info_move(&frame->info[info->index], info->pass);
 }
 
+// These are rolling per-shader execution histories, not timings attributed to
+// callback_frame_id. The GL queries complete asynchronously and libplacebo does
+// not expose the source frame identity of each returned sample.
+static void gpu_timing_report(struct vo *vo, bool final)
+{
+    struct priv *p = vo->priv;
+    if (!p->gpu_timing)
+        return;
+    int64_t now = mp_time_ns();
+    if (!final && now < p->gpu_timing_next_ns)
+        return;
+    p->gpu_timing_next_ns = now + INT64_C(10000000000);
+    struct frame_info *frames[] = { &p->perf_fresh, &p->perf_redraw };
+    for (int f = 0; f < 2; f++) {
+        for (int i = 0; i < frames[f]->count; i++) {
+            const struct pl_dispatch_info *pass = &frames[f]->info[i];
+            // Keep every line below LG's ~1KiB log limit. Description is bounded
+            // and normalized to avoid multi-line records from shader labels.
+            char desc[161] = {0};
+            if (pass->shader) {
+                snprintf(desc, sizeof(desc), "%s", pass->shader->description);
+                for (char *c = desc; *c; c++)
+                    if (*c == '\n' || *c == '\r') *c = ' ';
+            }
+            MP_ERR(vo, "MKS-GPU-PASS instance=%p mono_ns=%"PRId64
+                   " final=%d stage=%s index=%d signature=%"PRIu64
+                   " samples=%d last_ns=%"PRIu64" avg_ns=%"PRIu64
+                   " peak_ns=%"PRIu64" callback_frame_id=%"PRIu64
+                   " callback_pts=%.9f attribution=rolling-history desc=%s\n",
+                   p, now, final, f ? "blend" : "frame", i, pass->signature,
+                   pass->num_samples, pass->last, pass->average, pass->peak,
+                   p->gpu_timing_frame_id, p->gpu_timing_pts, desc);
+        }
+    }
+}
+
 static void update_options(struct vo *vo)
 {
     struct priv *p = vo->priv;
@@ -1015,9 +1142,1481 @@ static enum pl_color_primaries get_best_prim_container(const struct pl_raw_prima
 static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
                                      const struct mp_image *mpi);
 
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(PL_HAVE_MKS_YUV_OUTPUT)
+static bool fusion_full_rect(pl_rect2df r, int w, int h)
+{
+    return r.x0 == 0 && r.y0 == 0 && r.x1 == w && r.y1 == h;
+}
+
+static bool fusion_full_target_rect(pl_rect2df r, int w, int h)
+{
+    return ((r.x0 == 0 && r.x1 == w) || (r.x1 == 0 && r.x0 == w)) &&
+           ((r.y0 == 0 && r.y1 == h) || (r.y1 == 0 && r.y0 == h));
+}
+
+// Bit positions are stable diagnostic identifiers, not alternate eligibility.
+// 0 backend disabled, 1 no current, 2 config, 3 profile, 4 compat, 5 HLG,
+// 6 source orientation, 7 source format, 8 output alpha, 9 mix count,
+// 10 interpolation, 11 drawable flip, 12 planes, 13 target overlay,
+// 14 target rotation, 15 PQ, 16 primaries, 17 RGB, 18 full range,
+// 19 hooks, 20 distortion, 21 blend, 22 error diffusion, 23 ICC, 24 LUT,
+// 25 rounded/blurred background, 26 visualization, 27 FBO precision,
+// 28 target crop, 29 destination rect, 30 source rect, 31 no image,
+// 32 image overlay/rotation/LUT, 33 image alpha, 34 image crop.
+static uint64_t fusion_frame_rejects(struct vo *vo, const struct vo_frame *frame,
+                                    const struct pl_frame_mix *mix,
+                                    const struct pl_frame *target,
+                                    const struct pl_render_params *params,
+                                    const struct pl_swapchain_frame *swframe,
+                                    const struct ra_yuv_fusion_target *desc)
+{
+    struct priv *p = vo->priv;
+    const struct mp_image *mpi = frame->current;
+    pl_fmt fmt = swframe->fbo->params.format;
+    uint64_t mask = 0;
+#define REJECT(bit, condition) do { if (condition) mask |= UINT64_C(1) << (bit); } while (0)
+    REJECT(0, p->fusion_disabled || pl_gpu_is_failed(p->gpu));
+    REJECT(1, !mpi);
+    if (mpi) {
+        REJECT(2, !mpi->params.dv_config_present);
+        REJECT(3, mpi->params.dv_profile != 8);
+        REJECT(4, mpi->params.dv_bl_signal_compatibility_id != 4);
+        REJECT(5, mpi->params.color.transfer != PL_COLOR_TRC_HLG &&
+                  mpi->params.transfer_orig != PL_COLOR_TRC_HLG);
+        REJECT(6, mpi->params.rotate || mpi->params.vflip);
+        REJECT(7, mpi->imgfmt != IMGFMT_MEDIACODEC);
+        REJECT(30, p->src.x0 || p->src.y0 || p->src.x1 != mpi->w || p->src.y1 != mpi->h);
+    }
+    REJECT(8, p->ra_ctx->opts.want_alpha);
+    REJECT(9, mix->num_frames != 1);
+    REJECT(10, p->is_interpolated);
+    REJECT(11, desc->flipped);
+    REJECT(12, target->num_planes != 1);
+    REJECT(13, target->num_overlays);
+    REJECT(14, target->rotation);
+    REJECT(15, target->color.transfer != PL_COLOR_TRC_PQ);
+    REJECT(16, target->color.primaries != PL_COLOR_PRIM_BT_2020);
+    REJECT(17, target->repr.sys != PL_COLOR_SYSTEM_RGB);
+    REJECT(18, target->repr.levels != PL_COLOR_LEVELS_FULL);
+    REJECT(19, params->num_hooks);
+    REJECT(20, params->distort_params);
+    REJECT(21, params->blend_params);
+    REJECT(22, params->error_diffusion);
+    REJECT(23, p->icc_profile);
+    REJECT(24, target->lut);
+    REJECT(25, !mp_yuv_fusion_background_eligible(params->corner_rounding,
+                                                          params->background, params->border));
+    REJECT(26, params->color_map_params && params->color_map_params->visualize_lut);
+    REJECT(27, !fmt || fmt->type != PL_FMT_FLOAT || fmt->num_components != 4 ||
+                   fmt->component_depth[0] != 16 || fmt->component_depth[1] != 16 ||
+                   fmt->component_depth[2] != 16 || fmt->component_depth[3] != 16);
+    REJECT(28, !fusion_full_target_rect(target->crop, desc->w, desc->h));
+    REJECT(29, p->dst.x0 || p->dst.y0 || p->dst.x1 != desc->w || p->dst.y1 != desc->h);
+    const struct pl_frame *image = mix->num_frames == 1 ? mix->frames[0] : NULL;
+    REJECT(31, !image);
+    if (image) {
+        REJECT(32, image->num_overlays || image->rotation || image->lut);
+        REJECT(33, image->repr.alpha == PL_ALPHA_INDEPENDENT ||
+                   image->repr.alpha == PL_ALPHA_PREMULTIPLIED);
+        REJECT(34, !mpi || !fusion_full_rect(image->crop, mpi->w, mpi->h));
+    }
+#undef REJECT
+    return mask;
+}
+
+#if HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_YUV_COMPARE)
+static bool compare_current(struct priv *p)
+{
+    return mks_android_yuv_compare_current(p->ra_ctx, p->compare_id,
+                                           p->compare_generation);
+}
+
+static bool compare_baseline_ok(struct priv *p)
+{
+#if defined(PL_HAVE_MKS_UV_ATLAS_ANCHOR)
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+    if (p->atlas_reuse && p->atlas_read)
+        return pl_opengl_uv_atlas_read_baseline_ok(p->atlas_read);
+#endif
+    if (p->compare_atlas)
+        return p->atlas_anchor && pl_opengl_uv_atlas_anchor_baseline_ok(p->atlas_anchor);
+#endif
+    return pl_opengl_yuv_compare_baseline_ok(p->gpu, p->fusion_target);
+}
+
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+static bool atlas_read_seed_saved(struct priv *, const char *, size_t, const char *);
+static void atlas_read_seed_ready(struct vo *);
+static void atlas_reuse_poll(struct vo *);
+static bool atlas_consumer_render(struct vo *, const struct vo_frame *, const struct pl_frame_mix *,
+    const struct pl_frame *, const struct pl_render_params *, const struct pl_swapchain_frame *,
+    const struct ra_yuv_fusion_target *);
+#endif
+
+static void compare_fail_transaction(struct vo *vo, const char *reason)
+{
+    struct priv *p = vo->priv;
+    if (p->compare_terminal && p->compare_fatal_context)
+        return;
+    bool owner = mks_android_yuv_compare_owner_current(p->ra_ctx);
+    bool restored = !owner && mks_android_yuv_compare_restore_owner(p->ra_ctx);
+    struct mp_yuv_compare_abort_plan plan = mp_yuv_compare_abort_plan(
+        owner, restored, p->compare_frame_open);
+    bool frame_closed = !p->compare_frame_open;
+    if (plan.submit_frame) {
+        // End libplacebo's started-frame ownership, but never swap a failed
+        // diagnostic. submit_frame releases its frame lock on either result.
+        (void)pl_swapchain_submit_frame(p->sw);
+        p->compare_frame_open = false;
+        frame_closed = true;
+    } else if (plan.abort_no_gl) {
+#if defined(PL_HAVE_MKS_YUV_ABORT_FRAME)
+        frame_closed = pl_opengl_swapchain_abort_frame_no_gl(p->sw);
+        if (frame_closed)
+            p->compare_frame_open = false;
+#endif
+    }
+    p->compare_active = false;
+    p->compare_terminal = true;
+    p->compare_fatal_context = plan.fatal;
+    p->frame_pending = false;
+    if ((owner || restored) && p->ra_ctx->fns->yuv_fusion_abort)
+        p->ra_ctx->fns->yuv_fusion_abort(p->ra_ctx);
+    MP_ERR(vo, "MKS-YUV-COMPARE event=capture-failed id=%"PRIu64" reason=%s terminal=1 owner_current=%d owner_restored=%d frame_closed=%d fatal_context=%d requires_force_stop=%d\n",
+           p->compare_id, reason, owner, restored, frame_closed,
+           p->compare_fatal_context, p->compare_fatal_context);
+}
+
+static bool compare_write_exclusive(const char *path, const void *data, size_t bytes)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return false;
+    const unsigned char *src = data;
+    bool ok = true;
+    while (bytes) {
+        ssize_t n = write(fd, src, bytes);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0) { ok = false; break; }
+        src += n; bytes -= n;
+    }
+    ok = ok && fsync(fd) == 0;
+    if (close(fd) != 0)
+        ok = false;
+    return ok;
+}
+
+#if defined(PL_HAVE_MKS_UV_ATLAS_ANCHOR)
+static bool atlas_result_valid(struct priv *p,
+    const struct pl_opengl_uv_atlas_anchor_result *r)
+{
+    if (!r || !p->compare_epoch_valid || !p->compare_frame_id || !p->compare_frame_token ||
+        r->capture_id != p->compare_id || r->generation != p->compare_generation ||
+        r->width != p->compare_width || r->height != p->compare_height ||
+        r->width <= 0 || r->height <= 0 ||
+        (uint64_t)r->width * r->height > MP_YUV_ATLAS_MAX_PIXELS ||
+        r->pixels != (size_t)r->width * r->height || r->rgba_words != r->pixels * 4 ||
+        r->atlas_words != r->pixels * 3 || r->read_format != 0x1908 || r->read_type != 0x1406 ||
+        !r->source_abi_ok || !r->fence_signaled || !r->atlas_complete || r->bad_atlas_pixels ||
+        r->finish_epoch != p->compare_error_epoch || !r->framebuffer[0] ||
+        !r->program_tokens[0] || !r->program_tokens[1] ||
+        r->program_tokens[0] != r->program_tokens[2] ||
+        r->program_tokens[0] == r->program_tokens[1] ||
+        !mp_yuv_compare_target_matches(p->compare_source_pts, p->compare_current_pts,
+                                       p->compare_target_pts))
+        return false;
+    for (int i = 0; i < 3; i++) {
+        if (!r->draw_ok[i] || !r->readback_ok[i] || !r->half_exact[i] ||
+            r->bad_half_components[i] || r->framebuffer[i] != r->framebuffer[0] ||
+            r->draw_epoch_before[i] != p->compare_error_epoch ||
+            r->draw_epoch_after[i] != p->compare_error_epoch ||
+            r->readback_epoch_before[i] != p->compare_error_epoch ||
+            r->readback_epoch_after[i] != p->compare_error_epoch)
+            return false;
+    }
+    return true;
+}
+
+static bool atlas_save(struct vo *vo,
+    const struct pl_opengl_uv_atlas_anchor_result *r,
+    const struct mks_yuv_compare_result *android, bool *invalid)
+{
+    struct priv *p = vo->priv;
+    const uint32_t *before = NULL, *middle = NULL, *after = NULL, *atlas = NULL;
+    const char *a0 = NULL, *atlas_fragment = NULL, *vertex = NULL, *original = NULL;
+    const uint8_t *baseline_vertices = NULL;
+    size_t vertex_bytes = 0, mismatches_ba = 0, mismatches_bb = 0;
+    uint32_t mask = 0;
+    if (!atlas_result_valid(p, r) || !compare_current(p) ||
+        !pl_opengl_uv_atlas_anchor_data(p->atlas_anchor, &before, &middle, &after, &atlas) ||
+        !mp_yuv_atlas_data_valid(before, middle, after, atlas, r->pixels,
+            r->rgba_words, r->atlas_words, &mismatches_ba, &mismatches_bb, &mask) ||
+        r->mismatches_before_atlas != mismatches_ba ||
+        r->mismatches_before_after != mismatches_bb || r->anchor_equal != !mask ||
+        !compare_current(p) ||
+        !pl_opengl_uv_atlas_anchor_sources(p->atlas_anchor, &a0, &atlas_fragment, &vertex, &original) ||
+        !mp_yuv_atlas_uninstrumented_source(a0) || !atlas_fragment || !*atlas_fragment ||
+        !strcmp(a0, atlas_fragment) || !vertex || !*vertex || !original || !*original ||
+        !strstr(a0, original) || strstr(strstr(a0, original) + 1, original))
+        return false;
+    char quad_metadata[8192] = "";
+    {
+        struct pl_opengl_yuv_compare_quad_layout q = {0};
+        if (!compare_current(p) ||
+            !pl_opengl_uv_atlas_anchor_vertices(p->atlas_anchor, &baseline_vertices, &q) ||
+            q.primitive != PL_PRIM_TRIANGLE_STRIP || q.indexed || q.vertex_count != 4 ||
+            q.num_attributes < 1 || q.num_attributes > 16 ||
+            q.position_attrib < 0 || q.position_attrib >= q.num_attributes ||
+            q.viewport.x0 || q.viewport.y0 || q.viewport.x1 != p->compare_width ||
+            q.viewport.y1 != p->compare_height || q.scissors.x0 || q.scissors.y0 ||
+            q.scissors.x1 != p->compare_width || q.scissors.y1 != p->compare_height ||
+            !mp_yuv_compare_quad_payloads_valid(baseline_vertices, baseline_vertices,
+                q.stride, q.byte_size, false))
+            return false;
+        size_t used = 0;
+#define QUAD_APPEND(...) do { \
+    int n = snprintf(quad_metadata + used, sizeof(quad_metadata) - used, __VA_ARGS__); \
+    if (n < 0 || (size_t)n >= sizeof(quad_metadata) - used) return false; \
+    used += n; \
+} while (0)
+        QUAD_APPEND("\"vertex_layout\":{\"primitive\":\"triangle_strip\",\"indexed\":false,"
+            "\"vertex_count\":4,\"num_attributes\":%d,\"position_attrib\":%d,"
+            "\"stride\":%zu,\"byte_size\":%zu,\"viewport\":[%d,%d,%d,%d],"
+            "\"scissors\":[%d,%d,%d,%d],\"attributes\":[",
+            q.num_attributes,
+            q.position_attrib, q.stride, q.byte_size,
+            q.viewport.x0, q.viewport.y0, q.viewport.x1, q.viewport.y1,
+            q.scissors.x0, q.scissors.y0, q.scissors.x1, q.scissors.y1);
+        for (int i = 0; i < q.num_attributes; i++) {
+            const struct pl_opengl_yuv_compare_quad_attrib *at = &q.attributes[i];
+            if (!mp_yuv_compare_identifier_valid(at->name, sizeof(at->name)) ||
+                !mp_yuv_compare_identifier_valid(at->format_name, sizeof(at->format_name)) ||
+                !mp_yuv_compare_identifier_valid(at->glsl_type, sizeof(at->glsl_type)) ||
+                at->fmt_type != PL_FMT_FLOAT || at->opaque || at->num_planes || at->location < 0 ||
+                at->num_components < 1 || at->num_components > 4 ||
+                at->texel_size != (size_t)at->num_components * 4 ||
+                at->offset % 4 || q.stride % 4 || at->offset > q.stride ||
+                at->texel_size > q.stride - at->offset ||
+                (i == q.position_attrib &&
+                 (at->num_components != 2 || strcmp(at->glsl_type, "vec2"))))
+                return false;
+            const char *types[] = {"float", "vec2", "vec3", "vec4"};
+            if (strcmp(at->glsl_type, types[at->num_components - 1]))
+                return false;
+            for (int j = 0; j < 4; j++) {
+                if (at->component_depth[j] < 0 || at->component_depth[j] > 32 ||
+                    (j < at->num_components && (at->component_depth[j] != 32 ||
+                     at->host_bits[j] != 32 || at->sample_order[j] != j)))
+                    return false;
+            }
+            for (int j = 0; j < i; j++) {
+                const struct pl_opengl_yuv_compare_quad_attrib *prev = &q.attributes[j];
+                if (prev->location == at->location || !strcmp(prev->name, at->name) ||
+                    (at->offset < prev->offset + prev->texel_size &&
+                     prev->offset < at->offset + at->texel_size))
+                    return false;
+            }
+            for (size_t v = 0; v < 4; v++) {
+                for (int c = 0; c < at->num_components; c++) {
+                    uint32_t bits;
+                    memcpy(&bits, baseline_vertices + v * q.stride + at->offset + c * 4, 4);
+                    if ((bits & 0x7f800000u) == 0x7f800000u)
+                        return false;
+                }
+            }
+            QUAD_APPEND("%s{\"name\":\"%s\",\"format_name\":\"%s\",\"glsl_type\":\"%s\","
+                "\"fmt_type\":\"float32\",\"opaque\":false,\"num_planes\":0,\"location\":%d,\"num_components\":%d,"
+                "\"component_depth\":[%d,%d,%d,%d],\"host_bits\":[%d,%d,%d,%d],"
+                "\"sample_order\":[%d,%d,%d,%d],\"offset\":%zu,\"texel_size\":%zu}",
+                i ? "," : "", at->name, at->format_name, at->glsl_type,
+                at->location, at->num_components, at->component_depth[0],
+                at->component_depth[1], at->component_depth[2], at->component_depth[3],
+                at->host_bits[0], at->host_bits[1], at->host_bits[2], at->host_bits[3],
+                at->sample_order[0], at->sample_order[1], at->sample_order[2], at->sample_order[3],
+                at->offset, at->texel_size);
+        }
+        if (!mp_yuv_compare_quad_positions_valid(baseline_vertices, q.stride,
+                q.byte_size, q.attributes[q.position_attrib].offset))
+            return false;
+        QUAD_APPEND("]}");
+#undef QUAD_APPEND
+        vertex_bytes = q.byte_size;
+    }
+    uint64_t epoch = 0;
+    if (!compare_current(p) || !compare_baseline_ok(p) ||
+        !pl_opengl_error_epoch(p->gpu, &epoch) || epoch != p->compare_error_epoch)
+        return false;
+    *invalid = mask != 0;
+    char basename[128], base[256], file[320];
+    snprintf(basename, sizeof(basename), "mks-yuv-atlas-%ld-%"PRIu64"%s",
+        (long)getpid(), p->compare_id, *invalid ? ".diagnostic-invalid" : "");
+    snprintf(base, sizeof(base), "/sdcard/Android/data/com.example.media_kit_hdr_lab/files/%s", basename);
+#define ATLAS_SAVE(suffix, data, bytes) do { \
+    snprintf(file, sizeof(file), "%s%s", base, suffix); \
+    if (!compare_write_exclusive(file, data, bytes)) return false; \
+} while (0)
+    ATLAS_SAVE(".a0-before.f32", before, r->rgba_words * 4);
+    ATLAS_SAVE(".atlas-a.f32", middle, r->rgba_words * 4);
+    ATLAS_SAVE(".a0-after.f32", after, r->rgba_words * 4);
+    ATLAS_SAVE(".atlas.bin", atlas, r->atlas_words * 4);
+    ATLAS_SAVE(".a0.frag.glsl", a0, strlen(a0));
+    ATLAS_SAVE(".atlas.frag.glsl", atlas_fragment, strlen(atlas_fragment));
+    ATLAS_SAVE(".vertex.glsl", vertex, strlen(vertex));
+    ATLAS_SAVE(".original-body.glsl", original, strlen(original));
+    ATLAS_SAVE(".baseline-vertices.bin", baseline_vertices, vertex_bytes);
+    ATLAS_SAVE(".android.bin", android->words, android->num_words * 4);
+    char json[16384];
+    size_t used = 0;
+#define ATLAS_APPEND(...) do { \
+    int n = snprintf(json + used, sizeof(json) - used, __VA_ARGS__); \
+    if (n < 0 || (size_t)n >= sizeof(json) - used) return false; \
+    used += n; \
+} while (0)
+    ATLAS_APPEND("{\"schema\":9,\"status\":\"%s\",\"scope\":\"rgb-anchor-capture-only-not-quality-pass\","
+        "\"pid\":%ld,\"capture_id\":%"PRIu64",\"generation\":%"PRIu64","
+        "\"frame_id\":%"PRIu64",\"frame_token\":%"PRIu64","
+        "\"source_pts\":%.9f,\"current_pts\":%.9f,\"target_pts\":%.9f,"
+        "\"width\":%d,\"height\":%d,\"pixels\":%zu,\"rgba_words\":%zu,\"atlas_words\":%zu,"
+        "\"byte_order\":\"little\",\"read_format\":%u,\"read_type\":%u,"
+        "\"readback_representation\":\"RGBA/FLOAT decoded RGB16F numerical values; not physical storage bytes\","
+        "\"instrumentation_scope\":\"A0 before and after have no capture SSBO/tap; atlas A is instrumented; final CSC is instrumented only in Android ROI\","
+        "\"draw_order\":[\"a0_before\",\"atlas_a\",\"a0_after\"],"
+        "\"draw_ok\":[true,true,true],\"readback_ok\":[true,true,true],\"half_exact\":[true,true,true],"
+        "\"program_tokens\":[\"%"PRIu64"\",\"%"PRIu64"\",\"%"PRIu64"\"],",
+        *invalid ? "diagnostic-invalid" : "complete", (long)getpid(), p->compare_id,
+        p->compare_generation, p->compare_frame_id, p->compare_frame_token,
+        p->compare_source_pts, p->compare_current_pts, p->compare_target_pts,
+        r->width, r->height, r->pixels, r->rgba_words, r->atlas_words,
+        r->read_format, r->read_type, r->program_tokens[0], r->program_tokens[1], r->program_tokens[2]);
+    const uint64_t *epochs[] = {r->draw_epoch_before, r->draw_epoch_after,
+                               r->readback_epoch_before, r->readback_epoch_after};
+    const char *epoch_names[] = {"draw_epoch_before", "draw_epoch_after",
+                                "readback_epoch_before", "readback_epoch_after"};
+    for (int i = 0; i < 4; i++)
+        ATLAS_APPEND("\"%s\":[\"%"PRIu64"\",\"%"PRIu64"\",\"%"PRIu64"\"],",
+            epoch_names[i], epochs[i][0], epochs[i][1], epochs[i][2]);
+    const char *reasons = mask == 3 ? "[\"a0-replay-mismatch\",\"atlas-rgb-mismatch\"]" :
+        mask == 1 ? "[\"a0-replay-mismatch\"]" : mask == 2 ? "[\"atlas-rgb-mismatch\"]" : "[]";
+    ATLAS_APPEND("\"finish_epoch\":\"%"PRIu64"\",\"framebuffer\":[%u,%u,%u],"
+        "\"source_abi_ok\":true,\"fence_signaled\":true,\"atlas_complete\":true,"
+        "\"anchor_equal\":%s,\"mismatches_before_atlas\":%zu,\"mismatches_before_after\":%zu,"
+        "\"bad_half_components\":[0,0,0],\"bad_atlas_pixels\":0,"
+        "\"anchor_validation_mask\":%u,\"anchor_validation_reasons\":%s,\"comparison_pass\":\"%s\",\"baseline_ok\":true,"
+        "\"android_status\":\"ready\",\"android_swap_succeeded\":true,\"android_fence_signaled\":true,"
+        "\"android_words\":%zu,\"android_roi\":{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d},%s,\"files\":{",
+        r->finish_epoch, r->framebuffer[0], r->framebuffer[1], r->framebuffer[2],
+        *invalid ? "false" : "true", mismatches_ba, mismatches_bb, mask, reasons,
+        *invalid ? "refused" : "unknown",
+        android->num_words, p->compare_x, p->compare_y, p->compare_w, p->compare_h, quad_metadata);
+    const char *keys[] = {"a0_before", "atlas_a", "a0_after", "atlas", "a0_fragment",
+        "atlas_fragment", "vertex", "original_body", "baseline_vertices", "android"};
+    const char *suffixes[] = {".a0-before.f32", ".atlas-a.f32", ".a0-after.f32", ".atlas.bin",
+        ".a0.frag.glsl", ".atlas.frag.glsl", ".vertex.glsl", ".original-body.glsl",
+        ".baseline-vertices.bin", ".android.bin"};
+    for (int i = 0; i < 10; i++)
+        ATLAS_APPEND("%s\"%s\":\"%s%s\"", i ? "," : "", keys[i], basename, suffixes[i]);
+    ATLAS_APPEND("}}\n");
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+    if (p->atlas_reuse && !atlas_read_seed_saved(p, json, used, basename))
+        return false;
+#endif
+    ATLAS_SAVE(".json", json, used);
+#undef ATLAS_APPEND
+#undef ATLAS_SAVE
+    MP_ERR(vo, "MKS-YUV-ATLAS event=%s id=%"PRIu64" generation=%"PRIu64" source_pts=%.9f file=%s.json comparison_pass=%s anchor_validation_mask=%u\n",
+        *invalid ? "capture-diagnostic-invalid" : "capture-complete", p->compare_id,
+        p->compare_generation, p->compare_source_pts, base, *invalid ? "refused" : "unknown", mask);
+    return true;
+}
+
+static void atlas_poll(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    if (!p->compare_active || !p->atlas_anchor)
+        return;
+    if (!compare_current(p)) {
+        compare_fail_transaction(vo, "atlas-context-or-identity-mismatch");
+        return;
+    }
+    struct mks_yuv_compare_result android = {0};
+    struct pl_opengl_uv_atlas_anchor_result result = {0};
+    int astatus = mks_android_yuv_compare_poll(p->ra_ctx, &android);
+    int status = PL_OPENGL_UV_ATLAS_ANCHOR_FAILED;
+    if (astatus != MKS_YUV_COMPARE_FAILED && compare_current(p))
+        status = pl_opengl_uv_atlas_anchor_poll(p->atlas_anchor, &result);
+    bool failed = astatus == MKS_YUV_COMPARE_FAILED ||
+        status == PL_OPENGL_UV_ATLAS_ANCHOR_FAILED || mp_time_ns() > p->compare_deadline;
+    if (!failed && (astatus != MKS_YUV_COMPARE_READY || status != PL_OPENGL_UV_ATLAS_ANCHOR_COMPLETE))
+        return;
+    bool identities = android.capture_id == p->compare_id &&
+        android.generation == p->compare_generation && android.roi.x == p->compare_x &&
+        android.roi.y == p->compare_y && android.roi.w == p->compare_w && android.roi.h == p->compare_h;
+    bool invalid = false;
+    bool saved = !failed && identities && android.swap_succeeded &&
+        android.num_words == (size_t)p->compare_w * p->compare_h * 7 &&
+        mp_yuv_compare_android_words_valid(android.words, android.num_words,
+            (size_t)p->compare_w * p->compare_h, NULL) && atlas_save(vo, &result, &android, &invalid);
+    p->compare_active = false;
+    if (!saved || invalid)
+        p->compare_terminal = true;
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+    if (saved && !invalid && p->atlas_reuse)
+        atlas_read_seed_ready(vo);
+#endif
+    if (!saved)
+        compare_fail_transaction(vo, "atlas-poll-or-save-failed");
+    if (!saved)
+        MP_ERR(vo, "MKS-YUV-ATLAS event=capture-failed id=%"PRIu64" generation=%"PRIu64" source_pts=%.9f lib_status=%d android_status=%d identities=%d saved=0\n",
+            p->compare_id, p->compare_generation, p->compare_source_pts, status, astatus, identities);
+}
+
+static bool atlas_render(struct vo *vo, const struct vo_frame *frame,
+    const struct pl_frame_mix *mix, const struct pl_frame *target,
+    const struct pl_render_params *params, const struct pl_swapchain_frame *swframe,
+    const struct ra_yuv_fusion_target *desc)
+{
+    struct priv *p = vo->priv;
+    const struct mp_image *source = mix->frames[0]->user_data;
+    p->compare_started = p->compare_active = true;
+    p->compare_id++; p->compare_generation = desc->generation;
+    p->compare_frame_id = frame->frame_id; p->compare_frame_token = desc->token;
+    p->compare_source_pts = source->pts; p->compare_current_pts = frame->current->pts;
+    p->compare_width = desc->w; p->compare_height = desc->h;
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+    if (p->atlas_reuse) {
+        p->atlas_phase = MP_ATLAS_SEED_PENDING;
+        p->atlas_seed_id = p->compare_id;
+        p->atlas_seed_frame_id = frame->frame_id;
+        p->atlas_seed_frame_token = desc->token;
+        p->atlas_seed_pts = source->pts;
+        p->atlas_seed_image = (uint64_t)(uintptr_t)source;
+    }
+#endif
+    p->compare_w = MPMIN(64, desc->w); p->compare_h = MPMIN(64, desc->h);
+    p->compare_x = (desc->w - p->compare_w) / 2; p->compare_y = (desc->h - p->compare_h) / 2;
+    p->compare_deadline = mp_time_ns() + INT64_C(120000000000);
+    bool android = mks_android_yuv_compare_arm(p->ra_ctx, p->compare_id, desc->generation,
+        (struct mks_yuv_compare_roi) {p->compare_x, p->compare_y, p->compare_w, p->compare_h});
+    if (android && compare_current(p))
+        p->atlas_anchor = pl_opengl_uv_atlas_anchor_arm(p->gpu, swframe->fbo,
+            &(struct pl_opengl_uv_atlas_anchor_params) {
+                .capture_id = p->compare_id, .generation = p->compare_generation});
+    MP_ERR(vo, "MKS-YUV-ATLAS event=armed id=%"PRIu64" generation=%"PRIu64" source_pts=%.9f android=%d lib=%d\n",
+        p->compare_id, p->compare_generation, source->pts, android, !!p->atlas_anchor);
+    if (!p->atlas_anchor) {
+        compare_fail_transaction(vo, "atlas-arm-failed");
+        return false;
+    }
+    p->compare_epoch_valid = compare_current(p) &&
+        pl_opengl_error_epoch(p->gpu, &p->compare_error_epoch);
+    if (!p->compare_epoch_valid) {
+        compare_fail_transaction(vo, "atlas-prerender-epoch-failed");
+        return false;
+    }
+    // The ordinary target and renderer planning are unchanged. Only the
+    // diagnostic backend transaction adds atlas A between the two original A0s.
+    bool rendered = pl_render_image_mix(p->rr, mix, target, params);
+    if (!compare_current(p)) {
+        compare_fail_transaction(vo, "atlas-postrender-owner-mismatch");
+        return false;
+    }
+    if (rendered)
+        pl_gpu_flush(p->gpu);
+    uint64_t after = 0;
+    p->compare_a_ready = rendered && compare_baseline_ok(p) &&
+        pl_opengl_error_epoch(p->gpu, &after) && after == p->compare_error_epoch;
+    if (!p->compare_a_ready)
+        compare_fail_transaction(vo, "atlas-render-or-receipt-failed");
+    return false;
+}
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+#include "yuv_atlas_read_impl.h"
+#endif
+#endif
+
+static bool compare_save(struct vo *vo,
+                          const struct pl_opengl_yuv_compare_result *lib,
+                          const struct mks_yuv_compare_result *android,
+                          uint32_t probe_validation_mask)
+{
+    struct priv *p = vo->priv;
+    bool diagnostic_invalid = probe_validation_mask != 0;
+    const char *b = NULL, *a = NULL, *vertex = NULL;
+    if (!compare_current(p) || !pl_opengl_yuv_compare_sources(p->gpu, p->fusion_target, &b, &a, &vertex) ||
+        !b || !a || !vertex || !android->words ||
+        (diagnostic_invalid && !p->compare_uv_probe))
+        return false;
+    // This is a producer assertion about one frozen dispatch's state and live
+    // resource handles. It does not claim a texture-pixel hash or A1 CSC data.
+    char repeat_metadata[1536] = "";
+#if defined(PL_HAVE_MKS_YUV_COMPARE_REPEAT)
+#if defined(PL_HAVE_MKS_YUV_COMPARE_ORACLE_SINGLE_PAIR)
+    if (p->compare_uv_single) {
+        if (!p->compare_uv_probe || !p->compare_uv_oracle ||
+            !lib->uv_oracle_single_pair ||
+            !mp_yuv_compare_draws_valid(false, lib->repetitions,
+                lib->draw_ok, lib->program_tokens) || !p->compare_epoch_valid ||
+            !mp_yuv_compare_epochs_valid(1, lib->draw_epoch_before,
+                lib->draw_epoch_after, p->compare_error_epoch))
+            return false;
+        snprintf(repeat_metadata, sizeof(repeat_metadata),
+            "\"uv_oracle_single_pair\":true,\"repetitions\":1,"
+            "\"draw_order\":[\"A1\",\"B1\"],\"draw_ok\":{\"A1\":true,\"B1\":true},"
+            "\"same_input_snapshot\":true,\"programs_reused\":false,"
+            "\"program_tokens\":[\"%"PRIu64"\",\"%"PRIu64"\"],"
+            "\"draw_epoch_before\":[\"%"PRIu64"\",\"%"PRIu64"\"],"
+            "\"draw_epoch_after\":[\"%"PRIu64"\",\"%"PRIu64"\"],"
+            "\"assertion_scope\":\"same frozen renderer input state and resource handles; no texture pixel hash\",",
+            lib->program_tokens[0], lib->program_tokens[1],
+            lib->draw_epoch_before[0], lib->draw_epoch_before[1],
+            lib->draw_epoch_after[0], lib->draw_epoch_after[1]);
+    } else
+#endif
+    if (p->compare_repeat) {
+        if (!mp_yuv_compare_draws_valid(true, lib->repetitions, lib->draw_ok,
+                                         lib->program_tokens) ||
+            !p->compare_epoch_valid ||
+            !mp_yuv_compare_epochs_valid(2, lib->draw_epoch_before,
+                                         lib->draw_epoch_after,
+                                         p->compare_error_epoch))
+            return false;
+        const char *names[4] = {"B1", p->compare_invariant_b ? "A01" : "A1",
+                               "B2", p->compare_invariant_b ? "A02" : "A2"};
+        if (p->compare_uv_oracle) {
+            names[0] = "A1"; names[1] = "B1";
+            names[2] = "A2"; names[3] = "B2";
+        }
+        snprintf(repeat_metadata, sizeof(repeat_metadata),
+            "\"repetitions\":2,\"draw_order\":[\"%s\",\"%s\",\"%s\",\"%s\"],"
+            "\"draw_ok\":{\"%s\":true,\"%s\":true,\"%s\":true,\"%s\":true},"
+            "\"same_input_snapshot\":true,\"programs_reused\":true,"
+            "\"program_tokens\":[\"%"PRIu64"\",\"%"PRIu64"\",\"%"PRIu64"\",\"%"PRIu64"\"],"
+            "\"draw_epoch_before\":[\"%"PRIu64"\",\"%"PRIu64"\",\"%"PRIu64"\",\"%"PRIu64"\"],"
+            "\"draw_epoch_after\":[\"%"PRIu64"\",\"%"PRIu64"\",\"%"PRIu64"\",\"%"PRIu64"\"],"
+            "\"assertion_scope\":\"same frozen renderer input state and resource handles; no texture pixel hash\",",
+            names[0], names[1], names[2], names[3],
+            names[0], names[1], names[2], names[3],
+            lib->program_tokens[0], lib->program_tokens[1],
+            lib->program_tokens[2], lib->program_tokens[3],
+            lib->draw_epoch_before[0], lib->draw_epoch_before[1],
+            lib->draw_epoch_before[2], lib->draw_epoch_before[3],
+            lib->draw_epoch_after[0], lib->draw_epoch_after[1],
+            lib->draw_epoch_after[2], lib->draw_epoch_after[3]);
+    }
+#endif
+    char tap_metadata[768] = "";
+    const char *original_body = NULL;
+#if defined(PL_HAVE_MKS_YUV_COMPARE_SAMPLE_TAP)
+    if (p->compare_sample_tap) {
+        const char *tap_body = NULL;
+        if (!p->compare_repeat || !lib->sample_tap || lib->words_per_pixel != 26 ||
+            lib->sample_sites != 1 || !compare_current(p) ||
+            !pl_opengl_yuv_compare_bodies(p->gpu, p->fusion_target,
+                                           &original_body, &tap_body) ||
+            !original_body || !*original_body || !tap_body || !*tap_body ||
+            (!p->compare_uv_oracle && !strstr(b, tap_body)) || !strstr(a, tap_body))
+            return false;
+        snprintf(tap_metadata, sizeof(tap_metadata),
+            "\"sample_tap\":true,\"sample_tap_site_count\":1,\"words_per_pixel\":26,"
+            "\"sample_tap_body_hash\":\"%"PRIu64"\","
+            "\"instrumentation_scope\":\"actual single textureLod site UV and sampled RGB; instrumentation may change shader compilation; not an unmodified shader\",",
+            lib->sample_tap_body_hash);
+    }
+#endif
+    char oracle_metadata[768] = "";
+#if defined(PL_HAVE_MKS_YUV_COMPARE_UV_ORACLE)
+    if (p->compare_uv_oracle) {
+        if (!p->compare_repeat || !p->compare_sample_tap || p->compare_invariant_b ||
+            !lib->uv_oracle || lib->uv_oracle_use_a != p->compare_uv_oracle_use_a ||
+            !p->compare_epoch_valid ||
+            !mp_yuv_compare_barriers_valid_count(p->compare_uv_single ? 1 : 2,
+                lib->uv_oracle_barriers,
+                lib->uv_oracle_barrier_ok, lib->uv_oracle_barrier_epoch_before,
+                lib->uv_oracle_barrier_epoch_after, p->compare_error_epoch))
+            return false;
+        if (p->compare_uv_single) {
+            snprintf(oracle_metadata, sizeof(oracle_metadata),
+                "\"uv_oracle\":true,\"uv_oracle_use_a\":%s,\"uv_oracle_barriers\":1,"
+                "\"uv_oracle_barrier_ok\":[true],"
+                "\"uv_oracle_barrier_epoch_before\":[\"%"PRIu64"\"],"
+                "\"uv_oracle_barrier_epoch_after\":[\"%"PRIu64"\"],",
+                p->compare_uv_oracle_use_a ? "true" : "false",
+                lib->uv_oracle_barrier_epoch_before[0], lib->uv_oracle_barrier_epoch_after[0]);
+        } else {
+            snprintf(oracle_metadata, sizeof(oracle_metadata),
+                "\"uv_oracle\":true,\"uv_oracle_use_a\":%s,\"uv_oracle_barriers\":2,"
+                "\"uv_oracle_barrier_ok\":[true,true],"
+                "\"uv_oracle_barrier_epoch_before\":[\"%"PRIu64"\",\"%"PRIu64"\"],"
+                "\"uv_oracle_barrier_epoch_after\":[\"%"PRIu64"\",\"%"PRIu64"\"],",
+                p->compare_uv_oracle_use_a ? "true" : "false",
+                lib->uv_oracle_barrier_epoch_before[0], lib->uv_oracle_barrier_epoch_before[1],
+                lib->uv_oracle_barrier_epoch_after[0], lib->uv_oracle_barrier_epoch_after[1]);
+        }
+    }
+#endif
+    char probe_metadata[768] = "";
+#if defined(PL_HAVE_MKS_YUV_COMPARE_ORACLE_PROBE)
+    if (p->compare_uv_probe) {
+        if (!p->compare_uv_oracle || !lib->uv_oracle_probe || !p->compare_probe_words ||
+            lib->uv_oracle_probe_words != p->compare_num_probe_words ||
+            probe_validation_mask > 127)
+            return false;
+        const char *names[] = {"gpu-dependency-invalid", "reason-mismatch",
+            "dependency-flag-mismatch", "selected-source-mismatch", "base-site-mismatch",
+            "observed-a-uv-mismatch", "selected-a-uv-mismatch"};
+        char reasons[256] = "[";
+        size_t reason_used = 1;
+        bool first = true;
+        for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            if (probe_validation_mask & (1u << i)) {
+                int n = snprintf(reasons + reason_used, sizeof(reasons) - reason_used,
+                                 "%s\"%s\"", first ? "" : ",", names[i]);
+                if (n < 0 || (size_t)n >= sizeof(reasons) - reason_used)
+                    return false;
+                reason_used += n;
+                first = false;
+            }
+        }
+        if (reason_used + 2 > sizeof(reasons))
+            return false;
+        reasons[reason_used++] = ']';
+        reasons[reason_used] = 0;
+        snprintf(probe_metadata, sizeof(probe_metadata),
+            "\"uv_oracle_probe\":true,\"uv_oracle_probe_words\":%zu,"
+            "\"uv_oracle_probe_words_per_pixel\":10,\"uv_oracle_probe_status\":\"complete\","
+            "\"oracle_preconditions_valid\":%s,\"oracle_cpu_validation_mask\":%u,"
+            "\"oracle_cpu_validation_reasons\":%s,",
+            lib->uv_oracle_probe_words, diagnostic_invalid ? "false" : "true",
+            probe_validation_mask, reasons);
+    }
+#endif
+    char invariant_metadata[256] = "";
+    const char *candidate_vertex = NULL;
+#if defined(PL_HAVE_MKS_YUV_COMPARE_INVARIANT_B)
+    if (p->compare_invariant_b) {
+        const char *baseline_vertex = NULL;
+        if (!p->compare_repeat || !p->compare_sample_tap || !lib->invariant_b ||
+            !compare_current(p) ||
+            !pl_opengl_yuv_compare_vertices(p->gpu, p->fusion_target,
+                &candidate_vertex, &baseline_vertex) ||
+            !baseline_vertex || strcmp(vertex, baseline_vertex) ||
+            !mp_yuv_compare_invariant_vertex_valid(candidate_vertex, baseline_vertex,
+                lib->invariant_uv_identifier, sizeof(lib->invariant_uv_identifier)))
+            return false;
+        snprintf(invariant_metadata, sizeof(invariant_metadata),
+            "\"invariant_b\":true,\"invariant_uv_identifier\":\"%s\",",
+            lib->invariant_uv_identifier);
+    }
+#endif
+    char quad_metadata[8192] = "";
+    const uint8_t *baseline_vertices = NULL, *candidate_vertices = NULL;
+    size_t vertex_bytes = 0;
+#if defined(PL_HAVE_MKS_YUV_COMPARE_QUAD_ORDER)
+    if (lib->quad_order != p->compare_quad_order ||
+        lib->quad_order_reverse != p->compare_quad_reverse)
+        return false;
+    if (p->compare_quad_order) {
+        struct pl_opengl_yuv_compare_quad_layout q = {0};
+        if (!p->compare_uv_single || p->compare_uv_oracle_use_a ||
+            !compare_current(p) ||
+            !pl_opengl_yuv_compare_quad_payloads(p->gpu, p->fusion_target,
+                &baseline_vertices, &candidate_vertices, &q) ||
+            q.primitive != PL_PRIM_TRIANGLE_STRIP || q.indexed || q.vertex_count != 4 ||
+            q.num_attributes < 1 || q.num_attributes > 16 ||
+            q.position_attrib < 0 || q.position_attrib >= q.num_attributes ||
+            q.viewport.x0 || q.viewport.y0 || q.viewport.x1 != p->compare_width ||
+            q.viewport.y1 != p->compare_height || q.scissors.x0 || q.scissors.y0 ||
+            q.scissors.x1 != p->compare_width || q.scissors.y1 != p->compare_height ||
+            !mp_yuv_compare_quad_payloads_valid(baseline_vertices, candidate_vertices,
+                q.stride, q.byte_size, p->compare_quad_reverse))
+            return false;
+        size_t used = 0;
+#define QUAD_APPEND(...) do { \
+    int n = snprintf(quad_metadata + used, sizeof(quad_metadata) - used, __VA_ARGS__); \
+    if (n < 0 || (size_t)n >= sizeof(quad_metadata) - used) return false; \
+    used += n; \
+} while (0)
+        QUAD_APPEND("\"quad_order\":true,\"quad_order_reverse\":%s,"
+            "\"quad_vertex_layout\":{\"primitive\":\"triangle_strip\",\"indexed\":false,"
+            "\"vertex_count\":4,\"num_attributes\":%d,\"position_attrib\":%d,"
+            "\"stride\":%zu,\"byte_size\":%zu,\"viewport\":[%d,%d,%d,%d],"
+            "\"scissors\":[%d,%d,%d,%d],\"attributes\":[",
+            p->compare_quad_reverse ? "true" : "false", q.num_attributes,
+            q.position_attrib, q.stride, q.byte_size,
+            q.viewport.x0, q.viewport.y0, q.viewport.x1, q.viewport.y1,
+            q.scissors.x0, q.scissors.y0, q.scissors.x1, q.scissors.y1);
+        for (int i = 0; i < q.num_attributes; i++) {
+            const struct pl_opengl_yuv_compare_quad_attrib *at = &q.attributes[i];
+            if (!mp_yuv_compare_identifier_valid(at->name, sizeof(at->name)) ||
+                !mp_yuv_compare_identifier_valid(at->format_name, sizeof(at->format_name)) ||
+                !mp_yuv_compare_identifier_valid(at->glsl_type, sizeof(at->glsl_type)) ||
+                at->fmt_type != PL_FMT_FLOAT || at->opaque || at->num_planes || at->location < 0 ||
+                at->num_components < 1 || at->num_components > 4 ||
+                at->texel_size != (size_t)at->num_components * 4 ||
+                at->offset % 4 || q.stride % 4 || at->offset > q.stride ||
+                at->texel_size > q.stride - at->offset ||
+                (i == q.position_attrib &&
+                 (at->num_components != 2 || strcmp(at->glsl_type, "vec2"))))
+                return false;
+            const char *types[] = {"float", "vec2", "vec3", "vec4"};
+            if (strcmp(at->glsl_type, types[at->num_components - 1]))
+                return false;
+            for (int j = 0; j < 4; j++) {
+                if (at->component_depth[j] < 0 || at->component_depth[j] > 32 ||
+                    (j < at->num_components && (at->component_depth[j] != 32 ||
+                     at->host_bits[j] != 32 || at->sample_order[j] != j)))
+                    return false;
+            }
+            for (int j = 0; j < i; j++) {
+                const struct pl_opengl_yuv_compare_quad_attrib *prev = &q.attributes[j];
+                if (prev->location == at->location || !strcmp(prev->name, at->name) ||
+                    (at->offset < prev->offset + prev->texel_size &&
+                     prev->offset < at->offset + at->texel_size))
+                    return false;
+            }
+            for (size_t v = 0; v < 4; v++) {
+                for (int c = 0; c < at->num_components; c++) {
+                    uint32_t bits;
+                    memcpy(&bits, baseline_vertices + v * q.stride + at->offset + c * 4, 4);
+                    if ((bits & 0x7f800000u) == 0x7f800000u)
+                        return false;
+                }
+            }
+            QUAD_APPEND("%s{\"name\":\"%s\",\"format_name\":\"%s\",\"glsl_type\":\"%s\","
+                "\"fmt_type\":\"float32\",\"opaque\":false,\"num_planes\":0,\"location\":%d,\"num_components\":%d,"
+                "\"component_depth\":[%d,%d,%d,%d],\"host_bits\":[%d,%d,%d,%d],"
+                "\"sample_order\":[%d,%d,%d,%d],\"offset\":%zu,\"texel_size\":%zu}",
+                i ? "," : "", at->name, at->format_name, at->glsl_type,
+                at->location, at->num_components, at->component_depth[0],
+                at->component_depth[1], at->component_depth[2], at->component_depth[3],
+                at->host_bits[0], at->host_bits[1], at->host_bits[2], at->host_bits[3],
+                at->sample_order[0], at->sample_order[1], at->sample_order[2], at->sample_order[3],
+                at->offset, at->texel_size);
+        }
+        if (!mp_yuv_compare_quad_positions_valid(baseline_vertices, q.stride,
+                q.byte_size, q.attributes[q.position_attrib].offset))
+            return false;
+        QUAD_APPEND("]},");
+#undef QUAD_APPEND
+        vertex_bytes = q.byte_size;
+    }
+#endif
+    char basename[128], base[256], file[320];
+    snprintf(basename, sizeof(basename), "mks-yuv-compare-%ld-%"PRIu64"%s",
+             (long)getpid(), p->compare_id, diagnostic_invalid ? ".diagnostic-invalid" : "");
+    snprintf(base, sizeof(base), "/sdcard/Android/data/com.example.media_kit_hdr_lab/files/%s", basename);
+    char extra_file_metadata[1024] = "";
+    if (p->compare_sample_tap) {
+        if (!original_body)
+            return false;
+        snprintf(extra_file_metadata, sizeof(extra_file_metadata),
+            ",\"original_body\":\"%s.original-body.glsl\"", basename);
+    }
+    if (p->compare_invariant_b) {
+        if (!candidate_vertex)
+            return false;
+        size_t used = strlen(extra_file_metadata);
+        snprintf(extra_file_metadata + used, sizeof(extra_file_metadata) - used,
+            ",\"candidate_vertex\":\"%s.candidate-vertex.glsl\"", basename);
+    }
+    if (p->compare_uv_probe) {
+        size_t used = strlen(extra_file_metadata);
+        snprintf(extra_file_metadata + used, sizeof(extra_file_metadata) - used,
+            ",\"oracle_probe\":\"%s.oracle-probe.bin\"", basename);
+    }
+    if (p->compare_quad_order) {
+        size_t used = strlen(extra_file_metadata);
+        snprintf(extra_file_metadata + used, sizeof(extra_file_metadata) - used,
+            ",\"baseline_vertices\":\"%s.baseline-vertices.bin\",\"candidate_vertices\":\"%s.candidate-vertices.bin\"",
+            basename, basename);
+    }
+#define SAVE(suffix, data, bytes) do { \
+    snprintf(file, sizeof(file), "%s%s", base, suffix); \
+    if (!compare_write_exclusive(file, data, bytes)) return false; \
+} while (0)
+    SAVE(".lib.bin", p->compare_words, lib->words * sizeof(uint32_t));
+    SAVE(".android.bin", android->words, android->num_words * sizeof(uint32_t));
+    SAVE(".candidate.glsl", b, strlen(b));
+    SAVE(".baseline.glsl", a, strlen(a));
+    SAVE(".vertex.glsl", vertex, strlen(vertex));
+    if (p->compare_sample_tap)
+        SAVE(".original-body.glsl", original_body, strlen(original_body));
+    if (p->compare_invariant_b)
+        SAVE(".candidate-vertex.glsl", candidate_vertex, strlen(candidate_vertex));
+    if (p->compare_uv_probe)
+        SAVE(".oracle-probe.bin", p->compare_probe_words,
+             p->compare_num_probe_words * sizeof(uint32_t));
+    if (p->compare_quad_order) {
+        SAVE(".baseline-vertices.bin", baseline_vertices, vertex_bytes);
+        SAVE(".candidate-vertices.bin", candidate_vertices, vertex_bytes);
+    }
+    char manifest[16384];
+    int length = snprintf(manifest, sizeof(manifest),
+        "{\"schema\":%d,\"status\":\"%s\",\"scope\":\"capture-only-not-comparison-pass\",%s%s%s%s%s%s"
+        "\"pid\":%ld,\"capture_id\":%"PRIu64",\"generation\":%"PRIu64","
+        "\"frame_id\":%"PRIu64",\"frame_token\":%"PRIu64","
+        "\"source_pts\":%.9f,\"current_pts\":%.9f,\"target_pts\":%.9f,\"shader_body_hash\":\"%"PRIu64"\","
+        "\"target_width\":%d,\"target_height\":%d,"
+        "\"roi\":{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d},"
+        "\"lib_candidate_ok\":true,\"lib_baseline_ok\":true,\"lib_status\":\"complete\","
+        "\"android_status\":\"ready\",\"android_swap_succeeded\":true,"
+        "\"lib_fence_signaled\":true,\"android_fence_signaled\":true,"
+        "\"lib_words\":%zu,\"android_words\":%zu,\"byte_order\":\"little\","
+        "\"files\":{\"lib\":\"%s.lib.bin\",\"android\":\"%s.android.bin\","
+        "\"candidate\":\"%s.candidate.glsl\",\"baseline\":\"%s.baseline.glsl\",\"vertex\":\"%s.vertex.glsl\"%s}}\n",
+        p->compare_quad_order ? 8 : p->compare_uv_single ? 7 : p->compare_uv_probe ? 6 : p->compare_uv_oracle ? 5 : p->compare_invariant_b ? 4 :
+            p->compare_sample_tap ? 3 : p->compare_repeat ? 2 : 1,
+        diagnostic_invalid ? "diagnostic-invalid" : "complete",
+        repeat_metadata, tap_metadata, invariant_metadata, oracle_metadata, probe_metadata, quad_metadata,
+        (long)getpid(), p->compare_id, p->compare_generation,
+        p->compare_frame_id, p->compare_frame_token,
+        p->compare_source_pts, p->compare_current_pts, p->compare_target_pts, lib->shader_body_hash,
+        p->compare_width, p->compare_height,
+        p->compare_x, p->compare_y, p->compare_w, p->compare_h,
+        lib->words, android->num_words, basename, basename, basename, basename, basename,
+        extra_file_metadata);
+    if (length < 0 || (size_t)length >= sizeof(manifest))
+        return false;
+    SAVE(".json", manifest, (size_t)length);
+#undef SAVE
+    MP_ERR(vo, "MKS-YUV-COMPARE event=%s id=%"PRIu64" generation=%"PRIu64" source_pts=%.9f file=%s.json comparison_pass=%s repetitions=%d sample_tap=%d invariant_b=%d uv_oracle=%d uv_oracle_use_a=%d uv_oracle_probe=%d uv_oracle_single_pair=%d quad_order=%d quad_order_reverse=%d\n",
+           diagnostic_invalid ? "capture-diagnostic-invalid" : "capture-complete",
+           p->compare_id, p->compare_generation, p->compare_source_pts, base,
+           diagnostic_invalid ? "refused" : "unknown",
+           p->compare_repeat && !p->compare_uv_single ? 2 : 1,
+           p->compare_sample_tap, p->compare_invariant_b,
+           p->compare_uv_oracle, p->compare_uv_oracle_use_a, p->compare_uv_probe,
+           p->compare_uv_single, p->compare_quad_order, p->compare_quad_reverse);
+    return true;
+}
+
+static void compare_poll(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+    if (p->atlas_reuse) {
+        atlas_reuse_poll(vo);
+        return;
+    }
+#endif
+#if defined(PL_HAVE_MKS_UV_ATLAS_ANCHOR)
+    if (p->compare_atlas) {
+        atlas_poll(vo);
+        return;
+    }
+#endif
+    if (!p->compare_active || !p->fusion_target)
+        return;
+    if (!compare_current(p)) {
+        compare_fail_transaction(vo, "context-or-capture-identity-mismatch");
+        return;
+    }
+    struct pl_opengl_yuv_compare_result lib = {0};
+    struct mks_yuv_compare_result android = {0};
+    int astatus = mks_android_yuv_compare_poll(p->ra_ctx, &android);
+    int lstatus = PL_OPENGL_YUV_COMPARE_FAILED;
+    if (astatus != MKS_YUV_COMPARE_FAILED && compare_current(p))
+        lstatus = pl_opengl_yuv_compare_poll(p->gpu, p->fusion_target,
+            p->compare_words, p->compare_num_words, &lib);
+    int pstatus = PL_OPENGL_YUV_COMPARE_COMPLETE;
+#if defined(PL_HAVE_MKS_YUV_COMPARE_ORACLE_PROBE)
+    if (p->compare_uv_probe) {
+        pstatus = PL_OPENGL_YUV_COMPARE_PENDING;
+        if (lstatus == PL_OPENGL_YUV_COMPARE_COMPLETE && compare_current(p))
+            pstatus = pl_opengl_yuv_compare_probe_poll(p->gpu, p->fusion_target,
+                p->compare_probe_words, p->compare_num_probe_words);
+    }
+#endif
+    bool failed = lstatus == PL_OPENGL_YUV_COMPARE_FAILED ||
+        pstatus == PL_OPENGL_YUV_COMPARE_FAILED ||
+        astatus == MKS_YUV_COMPARE_FAILED || mp_time_ns() > p->compare_deadline;
+    if (!failed && (lstatus != PL_OPENGL_YUV_COMPARE_COMPLETE ||
+                    pstatus != PL_OPENGL_YUV_COMPARE_COMPLETE ||
+                    astatus != MKS_YUV_COMPARE_READY))
+        return;
+    bool identities = lib.capture_id == p->compare_id &&
+        android.capture_id == p->compare_id &&
+        lib.generation == p->compare_generation &&
+        android.generation == p->compare_generation &&
+        android.roi.x == p->compare_x && android.roi.y == p->compare_y &&
+        android.roi.w == p->compare_w && android.roi.h == p->compare_h &&
+        lib.words == p->compare_num_words &&
+        android.num_words == (size_t)p->compare_w * p->compare_h * 7;
+    bool data_valid = identities && p->compare_frame_id && p->compare_frame_token &&
+        mp_yuv_compare_target_matches(p->compare_source_pts, p->compare_current_pts,
+                                      p->compare_target_pts) &&
+        lstatus == PL_OPENGL_YUV_COMPARE_COMPLETE &&
+        astatus == MKS_YUV_COMPARE_READY;
+#if defined(PL_HAVE_MKS_YUV_COMPARE_REPEAT)
+    data_valid = data_valid && mp_yuv_compare_draws_valid(p->compare_repeat && !p->compare_uv_single,
+        lib.repetitions, lib.draw_ok, lib.program_tokens);
+    if (p->compare_repeat)
+        data_valid = data_valid && p->compare_epoch_valid &&
+            mp_yuv_compare_epochs_valid(p->compare_uv_single ? 1 : 2, lib.draw_epoch_before,
+                lib.draw_epoch_after, p->compare_error_epoch);
+#endif
+#if defined(PL_HAVE_MKS_YUV_COMPARE_SAMPLE_TAP)
+    data_valid = data_valid && lib.sample_tap == p->compare_sample_tap &&
+        lib.words_per_pixel == (p->compare_sample_tap ? 26 : 14) &&
+        lib.sample_sites == (p->compare_sample_tap ? 1 : 0);
+#endif
+#if defined(PL_HAVE_MKS_YUV_COMPARE_INVARIANT_B)
+    data_valid = data_valid && lib.invariant_b == p->compare_invariant_b;
+#endif
+#if defined(PL_HAVE_MKS_YUV_COMPARE_UV_ORACLE)
+    data_valid = data_valid && lib.uv_oracle == p->compare_uv_oracle &&
+        lib.uv_oracle_use_a == p->compare_uv_oracle_use_a;
+    if (p->compare_uv_oracle)
+        data_valid = data_valid && p->compare_epoch_valid &&
+            mp_yuv_compare_barriers_valid_count(p->compare_uv_single ? 1 : 2,
+                lib.uv_oracle_barriers,
+                lib.uv_oracle_barrier_ok, lib.uv_oracle_barrier_epoch_before,
+                lib.uv_oracle_barrier_epoch_after, p->compare_error_epoch);
+#endif
+    size_t bad_word = SIZE_MAX, bad_probe_word = SIZE_MAX, bad_android_word = SIZE_MAX;
+    uint32_t probe_validation_mask = 0;
+#if defined(PL_HAVE_MKS_YUV_COMPARE_ORACLE_PROBE)
+    data_valid = data_valid && lib.uv_oracle_probe == p->compare_uv_probe;
+    if (p->compare_uv_probe)
+        data_valid = data_valid && lib.uv_oracle_probe_words == p->compare_num_probe_words &&
+            mp_yuv_compare_android_words_valid(android.words, android.num_words,
+                (size_t)p->compare_w * p->compare_h, &bad_android_word) &&
+            mp_yuv_compare_probe_words_valid_count(p->compare_uv_single ? 1 : 2,
+                p->compare_words, lib.words,
+                p->compare_probe_words, lib.uv_oracle_probe_words,
+                (size_t)p->compare_w * p->compare_h, p->compare_uv_oracle_use_a,
+                &probe_validation_mask, &bad_word, &bad_probe_word);
+    else
+#endif
+    {
+        // Original schemas retain their strict dependency/UV rejection. Only
+        // schema 6 can retain fully covered evidence of a failed dependency.
+        data_valid = data_valid && mp_yuv_compare_words_valid_layout(p->compare_words,
+            lib.words, (size_t)p->compare_w * p->compare_h,
+            p->compare_repeat ? 2 : 1, p->compare_sample_tap ? 26 : 14, &bad_word);
+        if (p->compare_uv_oracle && p->compare_uv_oracle_use_a)
+            data_valid = data_valid && mp_yuv_compare_oracle_uv_valid(p->compare_words,
+                lib.words, (size_t)p->compare_w * p->compare_h, &bad_word);
+    }
+#if defined(PL_HAVE_MKS_YUV_COMPARE_ORACLE_SINGLE_PAIR)
+    data_valid = data_valid && lib.uv_oracle_single_pair == p->compare_uv_single;
+#endif
+#if defined(PL_HAVE_MKS_YUV_COMPARE_QUAD_ORDER)
+    data_valid = data_valid && lib.quad_order == p->compare_quad_order &&
+        lib.quad_order_reverse == p->compare_quad_reverse;
+#endif
+    bool diagnostic_invalid = p->compare_uv_probe && probe_validation_mask != 0;
+    bool saved = !failed && identities && data_valid && lib.candidate_ok && lib.baseline_ok &&
+        android.swap_succeeded && compare_save(vo, &lib, &android, probe_validation_mask);
+    p->compare_active = false;
+    if (!saved || diagnostic_invalid)
+        p->compare_terminal = true;
+    if (!saved)
+        MP_ERR(vo, "MKS-YUV-COMPARE event=capture-failed id=%"PRIu64" generation=%"PRIu64" source_pts=%.9f lib_status=%d android_status=%d probe_status=%d identities=%d data_valid=%d bad_word=%zu bad_probe_word=%zu bad_android_word=%zu saved=0\n",
+               p->compare_id, p->compare_generation, p->compare_source_pts,
+               lstatus, astatus, pstatus, identities, data_valid, bad_word, bad_probe_word,
+               bad_android_word);
+    // Keep objects and Android's swap guard alive until teardown. Subsequent
+    // draws are intentionally frozen for this one-frame diagnostic session.
+}
+#endif
+
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(PL_HAVE_MKS_UV_ATLAS_READ)
+static void resize(struct vo *vo);
+
+// Default-off production UV table state machine for the fusion candidate.
+// The seeding frame renders the ordinary path; the zero-readback anchor rides
+// the very same final pass and records the UV table validated by schema10.
+// Subsequent gated fusion frames sample through the attached table; any
+// failure or identity detach returns to the ordinary path immediately.
+// A fused frame is only presented when the table-drive receipt advanced, so
+// a renderer-internal retry can never silently present untabled fusion.
+// Tear the table down. Returns false when the anchor or cache could not be
+// released (e.g. a foreign EGL owner); the stale pointer is kept so seeding
+// stays blocked instead of silently forgetting uncleaned resources.
+static bool fusion_table_detach(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    bool clean = true;
+    if (p->table_cache) {
+        pl_opengl_uv_atlas_table_detach(p->gpu);
+        clean &= pl_opengl_uv_atlas_cache_destroy(&p->table_cache);
+    }
+    if (p->table_anchor)
+        clean &= pl_opengl_uv_atlas_anchor_cancel(&p->table_anchor);
+    p->fusion_table_state = FT_OFF;
+    p->table_seed_frames = 0;
+    if (!clean)
+        MP_ERR(vo, "MKS-FUSION-TABLE event=cleanup-deferred anchor=%d cache=%d\n",
+               p->table_anchor ? 1 : 0, p->table_cache ? 1 : 0);
+    return clean;
+}
+
+// Every seeding failure funnels through here: two consecutive failures
+// disable the table for the session, and in production mode (the table was
+// enabled at init) the now-tableless fusion is blocked as well so playback
+// returns to the split ordinary path rather than the un-tabled fusion with
+// its known UV rounding regression.
+static void fusion_table_note_failure(struct vo *vo, const char *reason)
+{
+    struct priv *p = vo->priv;
+    p->table_failures++;
+    if (p->table_failures >= 2 && p->fusion_table_enabled) {
+        p->fusion_table_enabled = false;
+        MP_ERR(vo, "MKS-FUSION-TABLE event=table-disabled reason=%s failures=%d\n",
+               reason, p->table_failures);
+    }
+}
+
+static void fusion_table_poll(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    if (!p->fusion_table_enabled || p->fusion_table_state != FT_SEEDING ||
+        !p->table_anchor)
+        return;
+    if (++p->table_seed_frames > 10) {
+        MP_ERR(vo, "MKS-FUSION-TABLE event=seed-timeout\n");
+        fusion_table_note_failure(vo, "seed-timeout");
+        fusion_table_detach(vo);
+        return;
+    }
+    struct pl_opengl_uv_atlas_anchor_result result = {0};
+    int status = pl_opengl_uv_atlas_anchor_poll(p->table_anchor, &result);
+    if (status == PL_OPENGL_UV_ATLAS_ANCHOR_PENDING)
+        return;
+    if (status != PL_OPENGL_UV_ATLAS_ANCHOR_COMPLETE) {
+        // A failed poll drops this anchor and reseeds with a fresh epoch;
+        // the shared failure budget bounds the retries (transient stale
+        // errors recover on the next attempt, persistent failures disable
+        // the table for the session).
+        MP_ERR(vo, "MKS-FUSION-TABLE event=seed-retry status=%d failures=%d\n",
+               status, p->table_failures + 1);
+        fusion_table_note_failure(vo, "poll-failed");
+        fusion_table_detach(vo);
+        return;
+    }
+    pl_opengl_uv_atlas_cache cache = pl_opengl_uv_atlas_promote(&p->table_anchor);
+    if (!cache || !pl_opengl_uv_atlas_table_attach(p->gpu, cache)) {
+        MP_ERR(vo, "MKS-FUSION-TABLE event=promote-or-attach-failed\n");
+        if (cache) {
+            // An undestroyable cache must not leak: keep it owned for the
+            // deferred-cleanup retry (it also blocks reseeding).
+            if (!pl_opengl_uv_atlas_cache_destroy(&cache)) {
+                if (p->table_cache)
+                    MP_ERR(vo, "MKS-FUSION-TABLE event=cache-leak-on-double-defer\n");
+                else
+                    p->table_cache = cache;
+            }
+        }
+        fusion_table_note_failure(vo, "promote-or-attach");
+        fusion_table_detach(vo);
+        return;
+    }
+    p->table_cache = cache;
+    p->fusion_table_state = FT_READY;
+    // A successful seed clears the consecutive-failure budget.
+    p->table_failures = 0;
+    MP_ERR(vo, "MKS-FUSION-TABLE event=ready cache_id=%"PRIu64" failures=0\n",
+           result.capture_id);
+}
+
+static bool fusion_table_seed(struct vo *vo, const struct vo_frame *frame,
+                              const struct pl_swapchain_frame *swframe,
+                              const struct ra_yuv_fusion_target *desc)
+{
+    struct priv *p = vo->priv;
+    // A stale cache from a deferred cleanup must block seeding too: promoting
+    // a new cache would orphan the unreleased one.
+    if (p->table_anchor || p->table_cache || p->fusion_table_state != FT_OFF ||
+        !frame || !frame->current)
+        return false;
+    {
+        // Diagnostic-only persistent seed-failure injection: proves the
+        // shared failure budget disables the table under continuous failure
+        // instead of retrying forever. Default off.
+        char inject[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.mks.yuv_table_fail_seed", inject);
+        if (!strcmp(inject, "1")) {
+            MP_ERR(vo, "MKS-FUSION-TABLE event=arm-failed failures=%d (injected)\n",
+                   p->table_failures + 1);
+            fusion_table_note_failure(vo, "arm-failed-injected");
+            return false;
+        }
+    }
+    p->table_anchor = pl_opengl_uv_atlas_anchor_arm(p->gpu, swframe->fbo,
+        &(struct pl_opengl_uv_atlas_anchor_params) {
+            .capture_id = ++p->table_serial,
+            .generation = desc->generation,
+            .production_seed = true,
+        });
+    if (!p->table_anchor) {
+        MP_ERR(vo, "MKS-FUSION-TABLE event=arm-failed failures=%d\n",
+                p->table_failures + 1);
+        fusion_table_note_failure(vo, "arm-failed");
+        return false;
+    }
+    const struct mp_image *mpi_seed = frame->current;
+    p->table_src_w = mpi_seed->w;
+    p->table_src_h = mpi_seed->h;
+    const struct gl_video_opts *topts = p->opts_cache->opts;
+    p->table_scaler_kernel = topts->scaler[SCALER_SCALE].kernel.function;
+    p->table_dscale_kernel = topts->scaler[SCALER_DSCALE].kernel.function == SCALER_INHERIT
+        ? topts->scaler[SCALER_SCALE].kernel.function
+        : topts->scaler[SCALER_DSCALE].kernel.function;
+    p->table_linear_up = topts->linear_upscaling;
+    p->table_linear_down = topts->linear_downscaling;
+    p->table_correct_down = topts->correct_downscaling;
+    p->fusion_table_state = FT_SEEDING;
+    return true;
+}
+#endif
+
+static bool fusion_render(struct vo *vo, const struct vo_frame *frame,
+                           const struct pl_frame_mix *mix,
+                           const struct pl_frame *target,
+                           const struct pl_render_params *params,
+                           const struct pl_swapchain_frame *swframe,
+                           const struct ra_yuv_fusion_target *desc)
+{
+    struct priv *p = vo->priv;
+    uint64_t rejects = fusion_frame_rejects(vo, frame, mix, target, params, swframe, desc);
+    if (rejects) {
+        if (++p->fusion_gate_rejects == 1 || p->fusion_gate_rejects % 300 == 0) {
+            MP_ERR(vo, "MKS-FUSION gate-rejected=%"PRIu64" mask=0x%"PRIx64" compat_present=%d compat=%d flipped=%d mix=%d overlays=%d hooks=%d format=%s\n",
+                   p->fusion_gate_rejects, rejects, frame->current && frame->current->params.dv_config_present,
+                   frame->current ? frame->current->params.dv_bl_signal_compatibility_id : -1,
+                   swframe->flipped, mix->num_frames, target->num_overlays,
+                   params->num_hooks, swframe->fbo->params.format ?
+                   swframe->fbo->params.format->name : "unknown");
+            MP_ERR(vo, "MKS-FUSION target crop=%g,%g,%g,%g repr=%d/%d trc=%d prim=%d dst=%d,%d,%d,%d size=%dx%d\n",
+                   target->crop.x0, target->crop.y0, target->crop.x1, target->crop.y1,
+                   target->repr.sys, target->repr.levels, target->color.transfer,
+                   target->color.primaries, p->dst.x0, p->dst.y0, p->dst.x1, p->dst.y1,
+                   desc->w, desc->h);
+            const struct mp_image *mpi = frame->current;
+            if (mpi)
+                MP_ERR(vo, "MKS-FUSION source size=%dx%d params=%dx%d fmt=%d profile=%u trc=%d orig_trc=%d rotate=%d vflip=%d src=%d,%d,%d,%d want_alpha=%d\n",
+                       mpi->w, mpi->h, mpi->params.w, mpi->params.h, mpi->imgfmt,
+                       mpi->params.dv_profile, mpi->params.color.transfer,
+                       mpi->params.transfer_orig, mpi->params.rotate, mpi->params.vflip,
+                       p->src.x0, p->src.y0, p->src.x1, p->src.y1, p->ra_ctx->opts.want_alpha);
+            pl_fmt fmt = swframe->fbo->params.format;
+            if (fmt)
+                MP_ERR(vo, "MKS-FUSION format type=%d components=%d depths=%d,%d,%d,%d fbo=%dx%d\n",
+                       fmt->type, fmt->num_components, fmt->component_depth[0],
+                       fmt->component_depth[1], fmt->component_depth[2], fmt->component_depth[3],
+                       swframe->fbo->params.w, swframe->fbo->params.h);
+            MP_ERR(vo, "MKS-FUSION params distort=%d blend=%d error_diffusion=%d icc=%d target_lut=%d corner=%g blur=%g background=%d border=%d transparency=%g visualize=%d interpolated=%d drawable_flip=%d planes=%d target_rotation=%d\n",
+                   !!params->distort_params, !!params->blend_params, !!params->error_diffusion,
+                   !!p->icc_profile, !!target->lut, params->corner_rounding,
+                   params->blur_radius, params->background,
+                   params->border, params->background_transparency,
+                   params->color_map_params && params->color_map_params->visualize_lut,
+                   p->is_interpolated, desc->flipped, target->num_planes, target->rotation);
+            const struct pl_frame *image = mix->num_frames == 1 ? mix->frames[0] : NULL;
+            if (image)
+                MP_ERR(vo, "MKS-FUSION image crop=%g,%g,%g,%g alpha=%d rotation=%d overlays=%d lut=%d planes=%d\n",
+                       image->crop.x0, image->crop.y0, image->crop.x1, image->crop.y1,
+                       image->repr.alpha, image->rotation, image->num_overlays,
+                       !!image->lut, image->num_planes);
+        }
+        return false;
+    }
+#if HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_YUV_COMPARE)
+    const struct mp_image *source = mix->frames[0]->user_data;
+    bool compare_this_frame = p->compare_enabled && !p->compare_started && source &&
+        isfinite(source->pts) && source->pts != MP_NOPTS_VALUE && frame->current &&
+        isfinite(frame->current->pts) && frame->current->pts != MP_NOPTS_VALUE &&
+        (mp_yuv_compare_target_matches(source->pts, frame->current->pts,
+                                      p->compare_target_pts)
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+         || (p->atlas_reuse && p->atlas_phase == MP_ATLAS_WAIT_T2 &&
+             mp_yuv_compare_target_matches(source->pts, frame->current->pts,
+                                           p->atlas_second_pts))
+#endif
+        );
+    // A compare session always displays ordinary A. Preliminary B is legal
+    // only inside the explicitly armed, swap-protected one-frame transaction.
+    if (p->compare_requested && !compare_this_frame)
+        return false;
+#else
+    if (p->compare_requested)
+        return false; // unsupported diagnostic must never become production B
+#endif
+#if HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_UV_ATLAS_ANCHOR)
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+    if (compare_this_frame && p->atlas_reuse &&
+        (p->atlas_phase == MP_ATLAS_T1_REDRAW || p->atlas_phase == MP_ATLAS_WAIT_T2))
+        return atlas_consumer_render(vo, frame, mix, target, params, swframe, desc);
+    // With reuse enabled only the pending seed may open the anchor
+    // transaction; every later phase must never re-seed or rebuild a table.
+    if (compare_this_frame && p->compare_atlas &&
+        (!p->atlas_reuse || p->atlas_phase == MP_ATLAS_SEED ||
+         p->atlas_phase == MP_ATLAS_SEED_PENDING))
+        return atlas_render(vo, frame, mix, target, params, swframe, desc);
+    // While the reuse session waits (ACK, pending polls, done, rejected) a
+    // seed-PTS redraw must never fall into the legacy ROI compare arm: the
+    // reuse poll owns all transactions there and nobody would consume it.
+    // Keep displaying original A through the ordinary fused path instead.
+    if (compare_this_frame && p->atlas_reuse)
+        return false;
+#elif defined(PL_HAVE_MKS_UV_ATLAS_ANCHOR)
+    if (compare_this_frame && p->compare_atlas)
+        return atlas_render(vo, frame, mix, target, params, swframe, desc);
+#endif
+#endif
+    // A fresh wrapper scopes the backend's sticky success receipt to this draw.
+    {
+        pl_tex_destroy(p->gpu, &p->fusion_target);
+        p->fusion_target = pl_opengl_wrap(p->gpu, pl_opengl_wrap_params(
+            .framebuffer = desc->framebuffer, .width = desc->w, .height = desc->h,
+            .iformat = GL_RGBA16F, // logical output; physical YUV drawable
+            .output_encoding = PL_OPENGL_OUTPUT_RGB16F_TO_BT2020_FULL_YUV,
+        ));
+        p->fusion_generation = desc->generation;
+    }
+    if (!p->fusion_target)
+        return false;
+    struct pl_frame fused = *target;
+    fused.planes[0].texture = p->fusion_target;
+#if HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_YUV_COMPARE)
+    if (compare_this_frame)
+    {
+        p->compare_started = true;
+        p->compare_active = true;
+        p->compare_id++;
+        p->compare_generation = desc->generation;
+        p->compare_frame_id = frame->frame_id; p->compare_frame_token = desc->token;
+        p->compare_source_pts = source->pts;
+        p->compare_current_pts = frame->current->pts;
+        p->compare_width = desc->w; p->compare_height = desc->h;
+        p->compare_w = MPMIN(64, desc->w);
+        p->compare_h = MPMIN(64, desc->h);
+        p->compare_x = (desc->w - p->compare_w) / 2;
+        p->compare_y = (desc->h - p->compare_h) / 2;
+        p->compare_num_words = (size_t)p->compare_w * p->compare_h *
+                               (p->compare_sample_tap ? 26 : 14) *
+                               (p->compare_repeat && !p->compare_uv_single ? 2 : 1);
+        p->compare_words = talloc_zero_array(p, uint32_t, p->compare_num_words);
+        if (p->compare_uv_probe) {
+            p->compare_num_probe_words = (size_t)p->compare_w * p->compare_h *
+                                         (p->compare_uv_single ? 10 : 20);
+            p->compare_probe_words = talloc_zero_array(p, uint32_t,
+                                                       p->compare_num_probe_words);
+        }
+        p->compare_deadline = mp_time_ns() + INT64_C(15000000000);
+        struct mks_yuv_compare_roi roi = {
+            p->compare_x, p->compare_y, p->compare_w, p->compare_h,
+        };
+        // Android must prohibit any preliminary B swap before lib can issue B.
+        bool android_armed = mks_android_yuv_compare_arm(p->ra_ctx,
+            p->compare_id, desc->generation, roi);
+        bool lib_armed = android_armed && p->compare_words &&
+            (!p->compare_uv_probe || p->compare_probe_words) &&
+            pl_opengl_yuv_compare_arm(p->gpu, p->fusion_target,
+                &(struct pl_opengl_yuv_compare_params) {
+                    .capture_id = p->compare_id, .generation = desc->generation,
+                    .baseline = swframe->fbo, .x = roi.x, .y = roi.y,
+                    .width = roi.w, .height = roi.h,
+#if defined(PL_HAVE_MKS_YUV_COMPARE_REPEAT)
+                    .repeat = p->compare_repeat,
+#endif
+#if defined(PL_HAVE_MKS_YUV_COMPARE_SAMPLE_TAP)
+                    .sample_tap = p->compare_sample_tap,
+#endif
+#if defined(PL_HAVE_MKS_YUV_COMPARE_INVARIANT_B)
+                    .invariant_b = p->compare_invariant_b,
+#endif
+#if defined(PL_HAVE_MKS_YUV_COMPARE_UV_ORACLE)
+                    .uv_oracle = p->compare_uv_oracle,
+                    .uv_oracle_use_a = p->compare_uv_oracle_use_a,
+#endif
+#if defined(PL_HAVE_MKS_YUV_COMPARE_ORACLE_PROBE)
+                    .uv_oracle_probe = p->compare_uv_probe,
+#endif
+#if defined(PL_HAVE_MKS_YUV_COMPARE_ORACLE_SINGLE_PAIR)
+                    .uv_oracle_single_pair = p->compare_uv_single,
+#endif
+#if defined(PL_HAVE_MKS_YUV_COMPARE_QUAD_ORDER)
+                    .quad_order = p->compare_quad_order,
+                    .quad_order_reverse = p->compare_quad_reverse,
+#endif
+                });
+        MP_ERR(vo, "MKS-YUV-COMPARE event=armed id=%"PRIu64" generation=%"PRIu64" source_pts=%.9f android=%d lib=%d\n",
+               p->compare_id, desc->generation, source->pts, android_armed, lib_armed);
+        if (!lib_armed) {
+            const struct pl_tex_params *base = &swframe->fbo->params;
+            pl_fmt fmt = base->format;
+            MP_ERR(vo, "MKS-YUV-COMPARE event=arm-input id=%"PRIu64" target=%dx%d baseline=%dx%d depth=%d renderable=%d format=%s type=%d components=%d bits=%d,%d,%d,%d roi=%d,%d,%d,%d\n",
+                   p->compare_id, p->fusion_target->params.w, p->fusion_target->params.h,
+                   base->w, base->h, base->d, base->renderable, fmt ? fmt->name : "unknown",
+                   fmt ? fmt->type : -1, fmt ? fmt->num_components : -1,
+                   fmt ? fmt->component_depth[0] : -1, fmt ? fmt->component_depth[1] : -1,
+                   fmt ? fmt->component_depth[2] : -1, fmt ? fmt->component_depth[3] : -1,
+                   roi.x, roi.y, roi.w, roi.h);
+            // Generic unwrap cannot expose a pseudo framebuffer wrapper.
+            // The library's private arm-rejected log is authoritative for IDs.
+            compare_fail_transaction(vo, "arm-failed");
+            return false;
+        }
+    }
+#endif
+#if HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_YUV_COMPARE)
+    if (p->compare_active) {
+        if (!compare_current(p)) {
+            compare_fail_transaction(vo, "pre-render-context-mismatch");
+            return false;
+        }
+        p->compare_epoch_valid = pl_opengl_error_epoch(p->gpu, &p->compare_error_epoch);
+        if (!p->compare_epoch_valid)
+            return false;
+    }
+#endif
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+    // Table-drive receipt: in production table mode a fused frame is only
+    // valid when the render actually sampled through the attached table. A
+    // renderer-internal retry (e.g. after the dispatch dropped a
+    // size-mismatched table) can otherwise report success while the frame
+    // was fused untabled — the known quality regression. Reject such frames
+    // so the fusion failure path re-renders the ordinary output.
+    uint64_t table_serial_before = p->fusion_table_was_enabled
+        ? pl_opengl_uv_atlas_table_pass_serial(p->gpu) : 0;
+#endif
+    bool rendered = pl_render_image_mix(p->rr, mix, &fused, params);
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+    if (rendered && p->fusion_table_was_enabled &&
+        !p->compare_requested && !p->compare_started && !p->compare_active &&
+        pl_opengl_uv_atlas_table_pass_serial(p->gpu) == table_serial_before) {
+        MP_ERR(vo, "MKS-FUSION-TABLE event=table-pass-missed\n");
+        rendered = false;
+    }
+#endif
+    // Validate submission errors before granting the one-shot swap receipt.
+    // This replaces the ordinary end-of-draw flush on successful fusion.
+#if HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_YUV_COMPARE)
+    if (p->compare_active && !compare_current(p)) {
+        compare_fail_transaction(vo, "post-render-context-mismatch");
+        return false;
+    }
+#endif
+    if (rendered)
+        pl_gpu_flush(p->gpu);
+#if HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_YUV_COMPARE)
+    if (p->compare_active) {
+        // One renderer invocation and lib dispatch use frozen input state.
+        // Oracle orders A1/barrier/B1 (then A2/barrier/B2 unless single-pair).
+        // Only the last A receives presentation credit after all required
+        // draws/barriers succeed. The original CSC later overwrites the last
+        // diagnostic B before the unique swap; no B swap is allowed.
+        bool baseline_ok = rendered && compare_current(p) &&
+            compare_baseline_ok(p);
+        uint64_t after = 0;
+        p->compare_a_ready = baseline_ok && p->compare_epoch_valid &&
+            pl_opengl_error_epoch(p->gpu, &after) && after == p->compare_error_epoch;
+        return false;
+    }
+#endif
+    bool confirmed = rendered && pl_opengl_yuv_output_ok(p->gpu, p->fusion_target);
+    // Faults are opt-in, once per VO, and only after a proven legal draw.
+    if (confirmed && p->fusion_fault && !p->fusion_fault_fired) {
+        p->fusion_fault_fired = true;
+        if (p->fusion_fault == 2) {
+            uint64_t before = 0, after = 0;
+            bool before_ok = pl_opengl_error_epoch(p->gpu, &before);
+            // INVALID_ENUM is a standard recoverable error with no GL state
+            // mutation. Backend checking must observe it and set its epoch.
+            if (before_ok) {
+                struct GL *gl = ra_gl_get(p->ra_ctx->ra);
+                gl->Enable(0xffffffffu);
+                confirmed = pl_opengl_yuv_output_ok(p->gpu, p->fusion_target);
+            } else {
+                confirmed = false;
+            }
+            bool after_ok = before_ok && pl_opengl_error_epoch(p->gpu, &after);
+            MP_ERR(vo, "MKS-FUSION fault=gl-invalid-enum once=1 injected=%d before_ok=%d after_ok=%d epoch_before=%"PRIu64" epoch_after=%"PRIu64" confirmed=%d\n",
+                   before_ok, before_ok, after_ok, before, after, confirmed);
+        } else {
+            confirmed = false;
+            MP_ERR(vo, "MKS-FUSION fault=simulated-commit once=1 no_gl_error_injected=1\n");
+        }
+    }
+    if (p->ra_ctx->fns->yuv_fusion_commit(p->ra_ctx, desc, confirmed)) {
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+        // Only a committed fused frame proves the consumer path recovered.
+        p->table_consume_failures = 0;
+#endif
+        return true;
+    }
+    p->fusion_draw_failures++;
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+    if (p->fusion_table_was_enabled && p->fusion_table_state != FT_OFF) {
+        // Production pairing: this failure originated in the table path (the
+        // table is dropped and its failure budget governs retries). Keep
+        // fusion armed so the state machine can reseed at the new geometry —
+        // the pairing gate still blocks any untabled fusion, and the table
+        // budget bounds reseeds. A geometry change must not permanently
+        // downgrade the session when the designed recovery is a rebuild.
+        p->table_consume_failures++;
+        MP_ERR(vo, "MKS-FUSION table-path-failure=%"PRIu64" consume-failures=%d (armed unless budget trips)\n",
+               p->fusion_draw_failures, p->table_consume_failures);
+        MP_ERR(vo, "MKS-FUSION-TABLE event=fusion-fallback-table-dropped failures=%d\n",
+               p->table_failures + 1);
+        if (p->table_consume_failures >= 2) {
+            p->fusion_table_enabled = false;
+            p->fusion_disabled = true;
+            MP_ERR(vo, "MKS-FUSION-TABLE event=table-disabled reason=consume-failures count=%d\n",
+                   p->table_consume_failures);
+        }
+        fusion_table_note_failure(vo, "fusion-fallback");
+        fusion_table_detach(vo);
+        // Caller must re-render the same mix into the original RGB target.
+        return false;
+    }
+#endif
+    p->fusion_disabled = true;
+    MP_ERR(vo, "MKS-FUSION disabled-after-failure=%"PRIu64" sticky_gpu_error=%d; rendering original RGB path\n",
+           p->fusion_draw_failures, pl_gpu_is_failed(p->gpu));
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+    if (p->fusion_table_state != FT_OFF) {
+        MP_ERR(vo, "MKS-FUSION-TABLE event=fusion-fallback-table-dropped failures=%d\n",
+               p->table_failures + 1);
+        fusion_table_note_failure(vo, "fusion-fallback");
+        fusion_table_detach(vo);
+    }
+#endif
+    // Caller must re-render the same mix into the original RGB target.
+    return false;
+}
+#endif
+
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_YUV_COMPARE)
+    if (p->compare_fatal_context)
+        return VO_FALSE;
+    if (p->compare_started) {
+        compare_poll(vo);
+        // A validated ACK or seed promotion may have unblocked this same
+        // invocation. Do not swallow the sole paused seek/redraw frame.
+        if (p->compare_started || p->compare_fatal_context)
+            return VO_FALSE;
+    }
+#endif
+    if (p->thermal.enabled) {
+        p->thermal.draw++;
+        p->thermal.redraw += frame->redraw;
+        p->thermal.display_synced += frame->display_synced;
+        p->thermal.frame_id = frame->frame_id;
+        if (frame->current)
+            p->thermal.pts = frame->current->pts;
+    }
+    if (p->gpu_timing) {
+        p->gpu_timing_frame_id = frame->frame_id;
+        if (frame->current)
+            p->gpu_timing_pts = frame->current->pts;
+    }
     pl_options pars = p->pars;
     pl_gpu gpu = p->gpu;
     update_options(vo);
@@ -1070,6 +2669,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         int id = frame->frame_id + n;
 
         if (p->want_reset) {
+            if (p->thermal.enabled)
+                p->thermal.queue_resets++;
             pl_renderer_flush_cache(p->rr);
             pl_queue_reset(p->queue);
             p->last_pts = 0.0;
@@ -1093,6 +2694,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             .unmap = unmap_frame,
             .discard = discard_frame,
         });
+        if (p->thermal.enabled)
+            p->thermal.queue_frames++;
 
         p->last_id = id;
     }
@@ -1252,6 +2855,39 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     }
 
     struct pl_swapchain_frame swframe;
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+    {
+        // Diagnostic-only controlled transition harness: on a property delta
+        // change, apply a REAL VO-level resize — the same dwidth + resize(vo)
+        // chain a live surface change runs — BEFORE the swapchain frame is
+        // started (an in-flight frame makes pl_swapchain_resize refuse, and
+        // only the VO rectangle would move). The resulting frame size is
+        // logged so the evidence shows the resize actually took effect.
+        char transition[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.mks.yuv_table_transition", transition);
+        int delta = atoi(transition);
+        if (delta != p->table_transition_delta) {
+            int adjust = delta - p->table_transition_delta;
+            p->table_transition_delta = delta;
+            if (vo->dwidth && vo->dheight && adjust) {
+                // Preserve the video aspect: p->dst is the aspect-fitted rect
+                // inside dwidth/dheight, so an equal-delta resize would
+                // letterbox and permanently trip the fusion geometry gate.
+                int old_w = vo->dwidth, old_h = vo->dheight;
+                vo->dwidth += adjust;
+                vo->dheight = (int) ((int64_t) vo->dwidth * old_h / old_w);
+                // The full real reconfig chain first (native window + YUV
+                // wrapper + RA swapchain; android_reconfig honors the armed
+                // property as its authoritative size), then VO bookkeeping.
+                if (p->ra_ctx->fns->reconfig)
+                    p->ra_ctx->fns->reconfig(p->ra_ctx);
+                resize(vo);
+                MP_ERR(vo, "MKS-FUSION-TABLE event=transition-inject dwidth=%d dheight=%d (delta %+d)\n",
+                       vo->dwidth, vo->dheight, adjust);
+            }
+        }
+    }
+#endif
     bool should_draw = sw->fns->start_frame(sw, NULL); // for wayland logic
     if (!should_draw || !pl_swapchain_start_frame(p->sw, &swframe)) {
         if (frame->current) {
@@ -1266,9 +2902,25 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 #endif
             pl_queue_update(p->queue, NULL, &qparams);
         }
+        if ((p->fusion_presentation_guard || p->fusion_frame_trace) &&
+            p->ra_ctx->fns->yuv_fusion_abort)
+            p->ra_ctx->fns->yuv_fusion_abort(p->ra_ctx);
         return VO_FALSE;
     }
 
+    if (p->compare_requested)
+        p->compare_frame_open = true;
+    struct ra_yuv_fusion_target fusion_desc = {0};
+    bool fusion_available = p->ra_ctx->fns->yuv_fusion_begin &&
+        p->ra_ctx->fns->yuv_fusion_commit &&
+        p->ra_ctx->fns->yuv_fusion_rgb_ready &&
+        p->ra_ctx->fns->yuv_fusion_begin(p->ra_ctx, &fusion_desc);
+    p->fusion_presentation_guard |= fusion_available;
+    bool fused = false, rgb_rendered = false;
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(PL_HAVE_MKS_YUV_OUTPUT)
+    uint64_t rgb_error_epoch = 0;
+    bool rgb_epoch_valid = false;
+#endif
     bool valid = false;
     p->is_interpolated = false;
 
@@ -1450,10 +3102,119 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     }
 #endif
 
-    // Render frame
-    if (!pl_render_image_mix(p->rr, &mix, &target, &params)) {
-        MP_ERR(vo, "Failed rendering frame!\n");
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(PL_HAVE_MKS_UV_ATLAS_READ)
+    // Only the consumer redraws (t1/t2) run with single-frame caching
+    // disabled; the seed anchor must keep the exact pass reuse the schema9
+    // anchor was validated with, and an invalid configuration must behave
+    // exactly like the ordinary path.
+    if (p->atlas_reuse && p->compare_enabled &&
+        (p->atlas_phase == MP_ATLAS_T1_REDRAW || p->atlas_phase == MP_ATLAS_WAIT_T2)) {
+        params.skip_caching_single_frame = true;
+        params.preserve_mixing_cache = false;
+    }
+#endif
+    // The original swapchain FBO is retained for a same-draw fallback.
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(PL_HAVE_MKS_YUV_OUTPUT)
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+    // Production UV table: poll any in-flight seed, drop dead tables, and
+    // seed on the first fully gated frame so the ordinary path stays on
+    // screen until the table is ready. The identity gate runs after the
+    // poll so a seed promoted to READY this frame is checked against this
+    // frame's source/scaler identity before its first table-driven draw.
+    bool fusion_table_block = false;
+    bool compare_session = p->compare_requested || p->compare_started || p->compare_active;
+    if (p->fusion_table_enabled || p->fusion_table_was_enabled) {
+        fusion_table_poll(vo);
+        if (p->fusion_table_state == FT_READY) {
+            const struct mp_image *mpi_now = frame->current;
+            const struct gl_video_opts *gopts = p->opts_cache->opts;
+            int dscale = gopts->scaler[SCALER_DSCALE].kernel.function == SCALER_INHERIT
+                ? gopts->scaler[SCALER_SCALE].kernel.function
+                : gopts->scaler[SCALER_DSCALE].kernel.function;
+            if (!pl_opengl_uv_atlas_table_active(p->gpu) || !mpi_now ||
+                mpi_now->w != p->table_src_w || mpi_now->h != p->table_src_h ||
+                gopts->scaler[SCALER_SCALE].kernel.function != p->table_scaler_kernel ||
+                dscale != p->table_dscale_kernel ||
+                gopts->linear_upscaling != p->table_linear_up ||
+                gopts->linear_downscaling != p->table_linear_down ||
+                gopts->correct_downscaling != p->table_correct_down) {
+                MP_ERR(vo, "MKS-FUSION-TABLE event=table-invalidated\n");
+                fusion_table_detach(vo);
+            }
+        }
+        // Mutual exclusion: a configured diagnostic compare session owns the
+        // final-pass machinery (its arm hooks live inside fusion_render);
+        // production seeding waits until it is gone and must not block the
+        // fusion path the diagnostics ride on.
+        if (p->fusion_table_enabled && p->fusion_table_state == FT_OFF &&
+            !can_interpolate && fusion_available && !compare_session &&
+            fusion_frame_rejects(vo, frame, &mix, &target, &params, &swframe, &fusion_desc) == 0)
+            fusion_table_block = fusion_table_seed(vo, frame, &swframe, &fusion_desc);
+        // Production pairing: without a READY table the tableless fusion
+        // (whose UV rounding regression motivated the table) must not run;
+        // fall back to the split ordinary path. An explicit table-off
+        // session (fusion_table_was_enabled == false) keeps plain fusion,
+        // and an active compare session keeps its own fusion entry alive.
+        if ((p->fusion_table_enabled || p->fusion_table_was_enabled) &&
+            p->fusion_table_state != FT_READY && !compare_session)
+            fusion_table_block = true;
+    }
+    if (fusion_available && !can_interpolate && !fusion_table_block)
+        fused = fusion_render(vo, frame, &mix, &target, &params, &swframe, &fusion_desc);
+#else
+    if (fusion_available && !can_interpolate)
+        fused = fusion_render(vo, frame, &mix, &target, &params, &swframe, &fusion_desc);
+#endif
+#else
+    (void) fusion_available;
+#endif
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_YUV_COMPARE)
+    if (p->compare_terminal)
         goto done;
+    if (p->compare_active) {
+        if (!p->compare_a_ready)
+            goto done;
+        rgb_rendered = true;
+    }
+#endif
+    // Render frame; never present old offscreen content after a failed fusion.
+    if (!fused && !rgb_rendered) {
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(PL_HAVE_MKS_YUV_OUTPUT)
+        if (fusion_available)
+            rgb_epoch_valid = pl_opengl_error_epoch(gpu, &rgb_error_epoch);
+#endif
+        bool rendered = pl_render_image_mix(p->rr, &mix, &target, &params);
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+        if (!rendered && p->fusion_table_state == FT_SEEDING) {
+            // The seed anchor transaction rides inside this render's final
+            // pass; its failure must not drop the frame. Count the failed
+            // seed, tear the dead anchor down, and re-render once through
+            // the anchor-free ordinary path. When the anchor cannot be
+            // released (foreign owner / held transaction) the retry is
+            // skipped and the frame falls through as before.
+            MP_ERR(vo, "MKS-FUSION-TABLE event=seed-frame-failed failures=%d\n",
+                   p->table_failures + 1);
+            fusion_table_note_failure(vo, "seed-frame-render");
+            if (fusion_table_detach(vo)) {
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(PL_HAVE_MKS_YUV_OUTPUT)
+                // Re-arm the presentation receipt BEFORE the salvaged render:
+                // the failed attempt may have consumed a recoverable error
+                // and bumped the epoch, but the second render's own errors
+                // must still fail the receipt, not be baked into its base.
+                if (fusion_available)
+                    rgb_epoch_valid = pl_opengl_error_epoch(gpu, &rgb_error_epoch);
+#endif
+                rendered = pl_render_image_mix(p->rr, &mix, &target, &params);
+                if (rendered)
+                    MP_ERR(vo, "MKS-FUSION-TABLE event=seed-frame-salvaged\n");
+            }
+        }
+#endif
+        if (!rendered) {
+            MP_ERR(vo, "Failed rendering frame!\n");
+            goto done;
+        }
+        rgb_rendered = true;
     }
 
     struct pl_frame ref_frame;
@@ -1478,15 +3239,72 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     mp_mutex_unlock(&vo->params_mutex);
 
     p->is_interpolated = pts_offset != 0 && mix.num_frames > 1;
+    if (p->thermal.enabled) {
+        p->thermal.w = mp_rect_w(p->dst);
+        p->thermal.h = mp_rect_h(p->dst);
+    }
     valid = true;
     // fall through
 
 done:
-    if (!valid) // clear with purple to indicate error
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_YUV_COMPARE)
+    if (p->compare_terminal)
+        return VO_TRUE;
+    if (p->compare_active && !compare_current(p)) {
+        compare_fail_transaction(vo, "pre-flush-context-mismatch");
+        return VO_TRUE;
+    }
+#endif
+    if (!valid && !fusion_available) // clear with purple to indicate error
         pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.5, 0.0, 1.0, 1.0 });
 
-    pl_gpu_flush(gpu);
-    p->frame_pending = true;
+    bool flush_context_ok = true;
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_YUV_COMPARE)
+    if (p->compare_active)
+        flush_context_ok = compare_current(p);
+#endif
+    if (!fused && flush_context_ok)
+        pl_gpu_flush(gpu);
+    if (fusion_available && !fused) {
+        bool current_rgb_ok = false;
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(PL_HAVE_MKS_YUV_OUTPUT)
+        uint64_t after = 0;
+        current_rgb_ok = valid && rgb_rendered && rgb_epoch_valid && flush_context_ok &&
+            pl_opengl_error_epoch(gpu, &after) && after == rgb_error_epoch;
+#if HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_YUV_COMPARE)
+        if (p->compare_active) {
+            uint64_t compare_after = 0;
+            bool baseline_ok = valid && rgb_rendered && p->compare_a_ready &&
+                compare_current(p) && compare_baseline_ok(p);
+            current_rgb_ok = baseline_ok && p->compare_epoch_valid &&
+                pl_opengl_error_epoch(gpu, &compare_after) &&
+                compare_after == p->compare_error_epoch;
+        }
+#endif
+#endif
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_UV_ATLAS_ANCHOR)
+        if (p->compare_atlas && p->compare_active && !current_rgb_ok) {
+            compare_fail_transaction(vo, "atlas-postflush-receipt-failed");
+            return VO_TRUE;
+        }
+#endif
+        p->ra_ctx->fns->yuv_fusion_rgb_ready(p->ra_ctx, &fusion_desc, current_rgb_ok);
+    }
+    (void) rgb_rendered;
+    if (valid && p->fusion_frame_trace && p->ra_ctx->fns->yuv_frame_trace &&
+        mix.num_frames == 1 && mix.frames[0] && mix.frames[0]->user_data && frame->current)
+    {
+        const struct mp_image *source = mix.frames[0]->user_data;
+        struct ra_yuv_frame_trace trace = {
+            .frame_id = frame->frame_id, .source_pts = source->pts,
+            .current_pts = frame->current->pts, .duration = frame->approx_duration,
+            .still = frame->still, .redraw = frame->redraw, .repeat = frame->repeat,
+        };
+        if (source->pts != MP_NOPTS_VALUE && frame->current->pts != MP_NOPTS_VALUE &&
+            isfinite(source->pts) && isfinite(frame->current->pts))
+            p->ra_ctx->fns->yuv_frame_trace(p->ra_ctx, &fusion_desc, &trace);
+    }
+    p->frame_pending = flush_context_ok;
     return VO_TRUE;
 }
 
@@ -1494,14 +3312,60 @@ static void flip_page(struct vo *vo)
 {
     struct priv *p = vo->priv;
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
+    if (p->thermal.enabled)
+        p->thermal.flip++;
 
+    // vo.c can flip after draw_frame returned false. Do not submit/swap an
+    // old offscreen after any successful experimental fusion session.
+    if (p->fusion_presentation_guard && !p->frame_pending)
+        return;
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_YUV_COMPARE)
+    if (p->compare_fatal_context)
+        return;
+    if (p->compare_started && p->frame_pending && !compare_current(p)) {
+        compare_fail_transaction(vo, "pre-submit-context-or-identity-mismatch");
+        return;
+    }
+#endif
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_UV_ATLAS_ANCHOR)
+    if (p->compare_atlas && p->compare_started && p->frame_pending &&
+        !compare_baseline_ok(p)) {
+        compare_fail_transaction(vo, "atlas-presubmit-receipt-failed");
+        return;
+    }
+#endif
     if (p->frame_pending) {
-        if (!pl_swapchain_submit_frame(p->sw))
-            MP_ERR(vo, "Failed presenting frame!\n");
+        if (p->thermal.enabled)
+            p->thermal.submit++;
+        bool submitted = pl_swapchain_submit_frame(p->sw);
+        p->compare_frame_open = false;
         p->frame_pending = false;
+        if (!submitted) {
+            MP_ERR(vo, "Failed presenting frame!\n");
+            if ((p->fusion_presentation_guard || p->fusion_frame_trace) &&
+                p->ra_ctx->fns->yuv_fusion_abort)
+                p->ra_ctx->fns->yuv_fusion_abort(p->ra_ctx);
+            if (p->fusion_presentation_guard)
+                return;
+        }
     }
 
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_UV_ATLAS_ANCHOR)
+    if (p->compare_atlas && p->compare_started) {
+        uint64_t epoch = 0;
+        if (!compare_current(p) || !compare_baseline_ok(p) ||
+            !pl_opengl_error_epoch(p->gpu, &epoch) || epoch != p->compare_error_epoch) {
+            compare_fail_transaction(vo, "atlas-postsubmit-receipt-failed");
+            return;
+        }
+    }
+#endif
     sw->fns->swap_buffers(sw);
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_YUV_COMPARE)
+    compare_poll(vo);
+#endif
+    mks_thermal_report(&p->thermal, false);
+    gpu_timing_report(vo, false);
 }
 
 static void get_vsync(struct vo *vo, struct vo_vsync_info *info)
@@ -1528,6 +3392,8 @@ static int query_format(struct vo *vo, int format)
 static void resize(struct vo *vo)
 {
     struct priv *p = vo->priv;
+    if (p->compare_fatal_context)
+        return;
     struct mp_rect src, dst;
     struct mp_osd_res osd;
     vo_get_src_dst_rects(vo, &src, &dst, &osd);
@@ -1550,6 +3416,8 @@ static void resize(struct vo *vo)
 static int reconfig(struct vo *vo, struct mp_image_params *params)
 {
     struct priv *p = vo->priv;
+    if (p->compare_fatal_context)
+        return -1;
     if (!p->ra_ctx->fns->reconfig(p->ra_ctx))
         return -1;
 
@@ -1844,6 +3712,14 @@ static void update_ra_ctx_options(struct vo *vo, struct ra_ctx_opts *ctx_opts)
 static int control(struct vo *vo, uint32_t request, void *data)
 {
     struct priv *p = vo->priv;
+    if (p->compare_fatal_context)
+        return VO_NOTIMPL;
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_YUV_COMPARE)
+    if (request == VOCTRL_CHECK_EVENTS)
+        compare_poll(vo);
+    if (p->compare_fatal_context)
+        return VO_NOTIMPL;
+#endif
 
     switch (request) {
     case VOCTRL_SET_PANSCAN:
@@ -1927,6 +3803,20 @@ static void wakeup(struct vo *vo)
 static void wait_events(struct vo *vo, int64_t until_time_ns)
 {
     struct priv *p = vo->priv;
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(PL_HAVE_MKS_UV_ATLAS_READ)
+    if (p->atlas_reuse && (p->atlas_phase == MP_ATLAS_WAIT_ACK ||
+                           p->atlas_phase == MP_ATLAS_T1_REDRAW ||
+                           p->atlas_phase == MP_ATLAS_WAIT_T2)) {
+        until_time_ns = MPMIN(until_time_ns, mp_time_ns() + INT64_C(100000000));
+#if HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_YUV_COMPARE)
+        // Property/deadline watch only; GL-owning cleanup waits for the next
+        // draw or flip poll so the owner context is never touched blind here.
+        atlas_read_wait_poll(vo);
+#endif
+    }
+#endif
+    if (p->compare_active)
+        until_time_ns = MPMIN(until_time_ns, mp_time_ns() + INT64_C(10000000));
     if (p->ra_ctx && p->ra_ctx->fns->wait_events) {
         p->ra_ctx->fns->wait_events(p->ra_ctx, until_time_ns);
     } else {
@@ -2127,6 +4017,39 @@ done:
 static void uninit(struct vo *vo)
 {
     struct priv *p = vo->priv;
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_YUV_COMPARE)
+    if (p->compare_requested && p->ra_ctx &&
+        !mks_android_yuv_compare_owner_current(p->ra_ctx))
+        compare_fail_transaction(vo, "pre-uninit-owner-mismatch");
+#endif
+    if (p->compare_fatal_context) {
+        // No queue unmap, hwdec, renderer, texture or context destructor is
+        // safe under a foreign context. This explicit diagnostic terminal
+        // state requires host force-stop; resources remain until process exit.
+        MP_ERR(vo, "MKS-YUV-COMPARE event=fatal-cleanup-deferred requires_force_stop=1\n");
+        return;
+    }
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(PL_HAVE_MKS_UV_ATLAS_READ)
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(PL_HAVE_MKS_UV_ATLAS_READ)
+    if (p->table_cache || p->table_anchor)
+        fusion_table_detach(vo);
+#endif
+    if ((p->atlas_read && !pl_opengl_uv_atlas_read_cancel(&p->atlas_read)) ||
+        (p->atlas_cache && !pl_opengl_uv_atlas_cache_destroy(&p->atlas_cache))) {
+        p->compare_terminal = p->compare_fatal_context = true;
+        MP_ERR(vo, "MKS-UV-ATLAS-READ event=cleanup-deferred requires_force_stop=1\n");
+        return;
+    }
+#endif
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(PL_HAVE_MKS_UV_ATLAS_ANCHOR)
+    if (p->atlas_anchor && !pl_opengl_uv_atlas_anchor_cancel(&p->atlas_anchor)) {
+        p->compare_terminal = p->compare_fatal_context = true;
+        MP_ERR(vo, "MKS-YUV-ATLAS event=cleanup-deferred id=%"PRIu64" requires_force_stop=1\n", p->compare_id);
+        return;
+    }
+#endif
+    mks_thermal_report(&p->thermal, true);
+    gpu_timing_report(vo, true);
     pl_queue_destroy(&p->queue); // destroy this first
     for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state.entries); i++)
         pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tex);
@@ -2153,6 +4076,23 @@ static void uninit(struct vo *vo)
     pl_lut_free(&p->next_opts->target_lut.lut);
 
     pl_icc_close(&p->icc_profile);
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && HAVE_EGL_ANDROID && defined(PL_HAVE_MKS_YUV_COMPARE)
+    if (p->compare_started) {
+        if (mks_android_yuv_compare_owner_current(p->ra_ctx)) {
+            if (p->fusion_target)
+                pl_opengl_yuv_compare_cancel(p->gpu, p->fusion_target);
+            mks_android_yuv_compare_cancel(p->ra_ctx);
+        } else {
+            // Do not delete query/SSBO/FBO names in an unrelated context.
+            // This default-off diagnostic abandons its borrowed wrapper until
+            // original context/process destruction rather than risking another.
+            MP_ERR(vo, "MKS-YUV-COMPARE event=cleanup-deferred id=%"PRIu64" reason=foreign-context-or-generation\n",
+                   p->compare_id);
+            p->fusion_target = NULL;
+        }
+    }
+#endif
+    pl_tex_destroy(p->gpu, &p->fusion_target);
     pl_renderer_destroy(&p->rr);
 
     for (int i = 0; i < VO_PASS_PERF_MAX; ++i) {
@@ -2177,6 +4117,138 @@ static void load_hwdec_api(void *ctx, struct hwdec_imgfmt_request *params)
 static int preinit(struct vo *vo)
 {
     struct priv *p = vo->priv;
+    mks_thermal_init(&p->thermal, vo->log, "vo", p);
+#if HAVE_ANDROID
+    char compare[PROP_VALUE_MAX] = {0}, compare_pts[PROP_VALUE_MAX] = {0};
+    char compare_repeat[PROP_VALUE_MAX] = {0};
+    char compare_tap[PROP_VALUE_MAX] = {0};
+    char compare_invariant[PROP_VALUE_MAX] = {0};
+    char compare_oracle[PROP_VALUE_MAX] = {0}, compare_oracle_a[PROP_VALUE_MAX] = {0};
+    char compare_probe[PROP_VALUE_MAX] = {0};
+    char compare_single[PROP_VALUE_MAX] = {0};
+    char compare_quad[PROP_VALUE_MAX] = {0}, compare_reverse[PROP_VALUE_MAX] = {0};
+    char compare_atlas[PROP_VALUE_MAX] = {0};
+    char atlas_reuse[PROP_VALUE_MAX] = {0}, atlas_second[PROP_VALUE_MAX] = {0};
+    char atlas_nonce[PROP_VALUE_MAX] = {0};
+    __system_property_get("debug.mks.yuv_compare", compare);
+    __system_property_get("debug.mks.yuv_compare_pts", compare_pts);
+    __system_property_get("debug.mks.yuv_compare_repeat", compare_repeat);
+    __system_property_get("debug.mks.yuv_tap", compare_tap);
+    __system_property_get("debug.mks.yuv_inv", compare_invariant);
+    __system_property_get("debug.mks.yuv_oracle", compare_oracle);
+    __system_property_get("debug.mks.yuv_oracle_a", compare_oracle_a);
+    __system_property_get("debug.mks.yuv_probe", compare_probe);
+    __system_property_get("debug.mks.yuv_single", compare_single);
+    __system_property_get("debug.mks.yuv_quad", compare_quad);
+    __system_property_get("debug.mks.yuv_rev", compare_reverse);
+    __system_property_get("debug.mks.yuv_atlas", compare_atlas);
+    __system_property_get("debug.mks.atlas_reuse", atlas_reuse);
+    __system_property_get("debug.mks.atlas_pts2", atlas_second);
+    __system_property_get("debug.mks.atlas_nonce", atlas_nonce);
+    char *compare_end = NULL;
+    p->compare_target_pts = strtod(compare_pts, &compare_end);
+    // Seed each VO instance before its local transaction increment. O_EXCL
+    // remains the final collision guard across PID reuse and old artifacts.
+    p->compare_id = (uint64_t)mp_time_ns();
+    p->compare_requested = !strcmp(compare, "1");
+    bool repeat_config_valid = mp_yuv_compare_repeat_config(compare_repeat,
+                                                           &p->compare_repeat);
+#if !defined(PL_HAVE_MKS_YUV_COMPARE_REPEAT)
+    repeat_config_valid = repeat_config_valid && !p->compare_repeat;
+#endif
+    bool tap_config_valid = mp_yuv_compare_tap_config(compare_tap, p->compare_repeat,
+                                                     &p->compare_sample_tap);
+#if !defined(PL_HAVE_MKS_YUV_COMPARE_SAMPLE_TAP)
+    tap_config_valid = tap_config_valid && !p->compare_sample_tap;
+#endif
+    bool invariant_config_valid = mp_yuv_compare_invariant_config(compare_invariant,
+        p->compare_repeat, p->compare_sample_tap, &p->compare_invariant_b);
+#if !defined(PL_HAVE_MKS_YUV_COMPARE_INVARIANT_B)
+    invariant_config_valid = invariant_config_valid && !p->compare_invariant_b;
+#endif
+    bool oracle_config_valid = mp_yuv_compare_oracle_config(compare_oracle,
+        compare_oracle_a, p->compare_repeat, p->compare_sample_tap,
+        p->compare_invariant_b, &p->compare_uv_oracle, &p->compare_uv_oracle_use_a);
+#if !defined(PL_HAVE_MKS_YUV_COMPARE_UV_ORACLE)
+    oracle_config_valid = oracle_config_valid && !p->compare_uv_oracle;
+#endif
+    bool probe_config_valid = mp_yuv_compare_probe_config(compare_probe,
+        p->compare_uv_oracle, &p->compare_uv_probe);
+#if !defined(PL_HAVE_MKS_YUV_COMPARE_ORACLE_PROBE)
+    probe_config_valid = probe_config_valid && !p->compare_uv_probe;
+#endif
+    bool single_config_valid = mp_yuv_compare_single_config(compare_single,
+        p->compare_uv_oracle, p->compare_uv_probe, p->compare_repeat,
+        p->compare_sample_tap, p->compare_invariant_b, &p->compare_uv_single);
+#if !defined(PL_HAVE_MKS_YUV_COMPARE_ORACLE_SINGLE_PAIR)
+    single_config_valid = single_config_valid && !p->compare_uv_single;
+#endif
+    bool quad_config_valid = mp_yuv_compare_quad_config(compare_quad, compare_reverse,
+        p->compare_uv_single, p->compare_uv_oracle_use_a,
+        &p->compare_quad_order, &p->compare_quad_reverse);
+#if !defined(PL_HAVE_MKS_YUV_COMPARE_QUAD_ORDER)
+    quad_config_valid = quad_config_valid && !p->compare_quad_order;
+#endif
+    bool atlas_config_valid = mp_yuv_atlas_config(compare_atlas,
+        p->compare_repeat || p->compare_sample_tap || p->compare_invariant_b ||
+        p->compare_uv_oracle || p->compare_uv_oracle_use_a || p->compare_uv_probe ||
+        p->compare_uv_single || p->compare_quad_order || p->compare_quad_reverse,
+        &p->compare_atlas);
+#if !defined(PL_HAVE_MKS_UV_ATLAS_ANCHOR)
+    atlas_config_valid = atlas_config_valid && !p->compare_atlas;
+#endif
+    bool atlas_requested = compare_atlas[0] && strcmp(compare_atlas, "0");
+    char *atlas_end = NULL;
+    double second_pts = strtod(atlas_second, &atlas_end);
+    bool reuse_config_valid = mp_yuv_atlas_read_config(atlas_reuse, p->compare_atlas,
+        p->compare_target_pts, second_pts, atlas_nonce, &p->atlas_reuse);
+    reuse_config_valid = reuse_config_valid && (!p->atlas_reuse ||
+        (atlas_second[0] && atlas_end && !*atlas_end));
+#if defined(PL_HAVE_MKS_UV_ATLAS_READ)
+    if (reuse_config_valid && p->atlas_reuse) {
+        p->atlas_second_pts = second_pts;
+        memcpy(p->atlas_nonce, atlas_nonce, sizeof(p->atlas_nonce));
+        p->atlas_phase = MP_ATLAS_SEED;
+    }
+#else
+    reuse_config_valid = reuse_config_valid && !p->atlas_reuse;
+#endif
+    bool reuse_requested = atlas_reuse[0] && strcmp(atlas_reuse, "0");
+    p->compare_requested |= atlas_requested || reuse_requested;
+    p->compare_enabled = p->compare_requested && compare_pts[0] &&
+        compare_end && !*compare_end && isfinite(p->compare_target_pts) &&
+        p->compare_target_pts >= 0 && repeat_config_valid && tap_config_valid &&
+        invariant_config_valid && oracle_config_valid && probe_config_valid && single_config_valid && quad_config_valid &&
+        atlas_config_valid && reuse_config_valid &&
+        (!(atlas_requested || reuse_requested) || !strcmp(compare, "1"));
+    if (p->compare_requested && !p->compare_enabled)
+        MP_ERR(vo, "%s event=config-invalid forcing_original_rgb=1\n",
+               reuse_requested ? "MKS-UV-ATLAS-READ" : atlas_requested ? "MKS-YUV-ATLAS" : "MKS-YUV-COMPARE");
+    char frame_trace[PROP_VALUE_MAX] = {0};
+    __system_property_get("debug.mks.yuv_frame_trace", frame_trace);
+    p->fusion_frame_trace = !strcmp(frame_trace, "1");
+    char fault[PROP_VALUE_MAX] = {0};
+    __system_property_get("debug.mks.yuv_fail_commit", fault);
+    if (!strcmp(fault, "1"))
+        p->fusion_fault = 1;
+    memset(fault, 0, sizeof(fault));
+    __system_property_get("debug.mks.yuv_fail_gl", fault);
+    if (!strcmp(fault, "1"))
+        p->fusion_fault = 2;
+    memset(fault, 0, sizeof(fault));
+    __system_property_get("debug.mks.yuv_fusion_table", fault);
+    // Production default (user ruling 2026-11-02): output fusion runs
+    // UNTABLED by default — the measured table gain over untabled fusion
+    // (~14 GPU-busy points) buys bit-exact UV coordinates, but the
+    // untabled difference (0.12% last-bit components) was never shown to be
+    // perceptually or safety-worse than the original path. The table stays
+    // a fully validated opt-in: debug.mks.yuv_fusion_table=1.
+    p->fusion_table_enabled = !strcmp(fault, "1");
+    p->fusion_table_was_enabled = p->fusion_table_enabled;
+    char timing[PROP_VALUE_MAX] = {0};
+    p->gpu_timing = __system_property_get("debug.mks.gpu_timing", timing) > 0 &&
+                    strcmp(timing, "render") == 0;
+#endif
     p->opts_cache = m_config_cache_alloc(p, vo->global, &gl_video_conf);
     p->next_opts_cache = m_config_cache_alloc(p, vo->global, &gl_next_conf);
     p->next_opts = p->next_opts_cache->opts;
@@ -2214,6 +4286,12 @@ static int preinit(struct vo *vo)
 
     pl_gpu_set_cache(p->gpu, p->shader_cache.cache);
     p->rr = pl_renderer_create(p->pllog, p->gpu);
+#if HAVE_GL && defined(PL_HAVE_OPENGL) && defined(PL_HAVE_MKS_UV_ATLAS_READ)
+    if (p->atlas_reuse) {
+        p->atlas_renderer_id = (uint64_t)(uintptr_t)p->rr;
+        p->atlas_renderer_generation = (uint64_t)mp_time_ns();
+    }
+#endif
     p->queue = pl_queue_create(p->gpu);
     p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
     p->osd_fmt[SUBBITMAP_BGRA] = pl_find_named_fmt(p->gpu, "bgra8");

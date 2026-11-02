@@ -207,6 +207,18 @@ const struct m_obj_list ra_ctx_type_obj_list = {
     .print_help_list = print_context_apis,
 };
 
+#define OPT_BASE_STRUCT struct surfacetexture_opts
+const struct m_sub_options surfacetexture_conf = {
+    .opts = (const m_option_t[]) {
+        {"surfacetexture-publish-flush", OPT_CHOICE(publish_flush,
+            {"immediate", MP_ST_PUBLISH_IMMEDIATE},
+            {"defer-30fps", MP_ST_PUBLISH_DEFER_30FPS})},
+        {0}
+    },
+    .size = sizeof(struct surfacetexture_opts),
+};
+
+#undef OPT_BASE_STRUCT
 #define OPT_BASE_STRUCT struct ra_ctx_opts
 const struct m_sub_options ra_ctx_conf = {
     .opts = (const m_option_t[]) {

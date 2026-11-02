@@ -1,5 +1,25 @@
 # So we don't have to reorganize the entire directory tree.
 incdir = include_directories('../')
+
+yuv_fusion_gate = executable('yuv-fusion-gate', 'yuv_fusion_gate.c',
+    include_directories: incdir, dependencies: [libplacebo])
+test('yuv-fusion-gate', yuv_fusion_gate, suite: 'unit')
+
+yuv_frame_trace = executable('yuv-frame-trace', 'yuv_frame_trace.c',
+    include_directories: incdir, dependencies: [libm])
+test('yuv-frame-trace', yuv_frame_trace, suite: 'unit')
+
+yuv_compare_vo = executable('yuv-compare-vo', 'yuv_compare_vo.c',
+    include_directories: incdir, dependencies: [libm])
+test('yuv-compare-vo', yuv_compare_vo, suite: 'unit')
+
+yuv_atlas_anchor = executable('yuv-atlas-anchor', 'yuv_atlas_anchor.c',
+    include_directories: incdir, dependencies: [libm])
+test('yuv-atlas-anchor', yuv_atlas_anchor, suite: 'unit')
+
+yuv_atlas_read = executable('yuv-atlas-read', 'yuv_atlas_read.c',
+    include_directories: incdir, dependencies: [libm])
+test('yuv-atlas-read', yuv_atlas_read, suite: 'unit')
 outdir = join_paths(build_root, 'test', 'out')
 refdir = ''
 
@@ -92,6 +112,11 @@ test('gl-video', gl_video)
 
 json = executable('json', 'json.c', include_directories: [incdir, incdir_public], link_with: test_utils)
 test('json', json)
+
+surfacetexture_publish_flush = executable('surfacetexture-publish-flush',
+    'surfacetexture_publish_flush.c', include_directories: incdir,
+    dependencies: libm)
+test('surfacetexture-publish-flush', surfacetexture_publish_flush)
 
 linked_list = executable('linked-list', files('linked_list.c'), include_directories: incdir)
 test('linked-list', linked_list)
