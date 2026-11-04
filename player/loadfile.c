@@ -768,6 +768,28 @@ void mp_switch_track_n(struct MPContext *mpctx, int order, enum stream_type type
 
     if (type == STREAM_VIDEO && order == 0) {
         reinit_video_chain(mpctx);
+        // Runtime video recovery (e.g. Android surface teardown re-enabling
+        // the video track): the demuxer video queue was dropped while the
+        // track was deselected, and playback_pts still points at the
+        // pre-teardown position. Left alone, video_output_image() turns
+        // STATUS_SYNCING into an implicit HR-seek to that position and
+        // decodes through the whole GOP before showing anything. Land on the
+        // nearest keyframe instead: a full A/V seek also flushes and
+        // re-anchors audio, so both streams resume from the same point.
+        // Initial starts have playback_pts == MP_NOPTS_VALUE and are not
+        // affected. A pending user seek wins (we do not queue over it).
+        // Backward playback is excluded: playback_pts carries the play_dir
+        // sign there and this recovery has no backward-specific landing
+        // semantics yet.
+        if (mpctx->vo_chain && !mpctx->vo_chain->is_coverart &&
+            mpctx->play_dir > 0 &&
+            mpctx->video_status == STATUS_SYNCING &&
+            mpctx->playback_pts != MP_NOPTS_VALUE &&
+            !mpctx->hrseek_active && mpctx->seek.type == MPSEEK_NONE)
+        {
+            queue_seek(mpctx, MPSEEK_ABSOLUTE, mpctx->playback_pts,
+                       MPSEEK_DEFAULT, 0);
+        }
     } else if (type == STREAM_AUDIO && order == 0) {
         reinit_audio_chain(mpctx);
     } else if (type == STREAM_SUB && order >= 0 && order <= 2) {
