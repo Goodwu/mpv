@@ -235,6 +235,14 @@ struct priv {
     uint64_t slot_fbo_attempts, shared_fbo_attempts, slot_fbo_fallbacks;
     uint64_t slot_fbo_copy_failures;
 
+    // Perf round 2 (lg-p84-perf-round2-20261102): diagnostic switch preferring
+    // the rgba16 unorm lease over rgba16f. The traffic/precision reasoning is
+    // NOT settled theory: both formats are 64 bits/texel, and the measured
+    // outcome on Adreno 530 (LG G6, this round) was a slowdown on both the
+    // copy pass and the fused pass. Default stays rgba16f; this flag is kept
+    // for reproduction of the negative result, not as a candidate.
+    bool lease_rgba16_pref;
+
     // Bridge-owned OES texture, wrapped for ra (we never create/delete the
     // GL texture object itself).
     struct ra_tex *oes_tex;
@@ -784,7 +792,9 @@ static bool probe_draw(struct ra_hwdec_mapper *mapper, const struct ra_format *f
 // 2D format probe, fixed order RGBA16F -> RGBA16 unorm (V2 review removed
 // RGB10_A2: IMGFMT_RGB30 declares the channel order swapped). A silent RGBA8
 // fallback is forbidden: if every candidate fails, the mapper init fails
-// outright.
+// outright. debug.mks.st_lease_rgba16=1 flips the probe order to prefer the
+// unorm lease (perf round 2); both candidates are still probed with the same
+// real-draw gate and RGBA8 stays forbidden either way.
 static const struct ra_format *probe_2d_format(struct ra_hwdec_mapper *mapper)
 {
     struct priv *p = mapper->priv;
@@ -801,39 +811,45 @@ static const struct ra_format *probe_2d_format(struct ra_hwdec_mapper *mapper)
     // order swapped relative to the GL format (V2 review, adjudicated).
     const int dst_imgfmts[] = { IMGFMT_RGBA64, IMGFMT_RGBA64 };
     const bool exact[] = { false, true };
+    const int order[] = { p->lease_rgba16_pref ? 1 : 0, p->lease_rgba16_pref ? 0 : 1 };
+    if (p->lease_rgba16_pref)
+        MP_ERR(mapper, "MKSURF: capability lease format preference rgba16-unorm "
+                        "(debug.mks.st_lease_rgba16=1; numeric gate is the "
+                        "fixed-PTS capture round, not this probe)\n");
 
     for (int i = 0; i < (int)MP_ARRAY_SIZE(candidates); i++) {
-        const struct ra_format *fmt = candidates[i];
+        int idx = order[i];
+        const struct ra_format *fmt = candidates[idx];
         if (!fmt) {
             MP_INFO(mapper, "MKSURF: format candidate %s unavailable in ra\n",
-                    names[i]);
+                    names[idx]);
             continue;
         }
         if (fmt->ctype != RA_CTYPE_UNORM && fmt->ctype != RA_CTYPE_FLOAT) {
             MP_INFO(mapper, "MKSURF: format candidate %s rejected (ctype)\n",
-                    names[i]);
+                    names[idx]);
             continue;
         }
         if (!fmt->renderable || !fmt->linear_filter) {
             MP_INFO(mapper, "MKSURF: format candidate %s rejected (renderable=%d "
-                            "linear_filter=%d)\n",
-                    names[i], fmt->renderable, fmt->linear_filter);
+                            "linear_filter=%d)\n", names[idx], fmt->renderable,
+                            fmt->linear_filter);
             continue;
         }
         if (!probe_draw(mapper, fmt)) {
             MP_INFO(mapper, "MKSURF: format candidate %s rejected (real FBO draw "
-                            "failed)\n", names[i]);
+                            "failed)\n", names[idx]);
             continue;
         }
 
         // Each rejected candidate is logged at its rejection site above.
-        p->dst_imgfmt = dst_imgfmts[i];
-        MP_INFO(mapper, "MKSURF: capability 2D format %s chosen (FBO complete + "
+        p->dst_imgfmt = dst_imgfmts[idx];
+        MP_ERR(mapper, "MKSURF: capability 2D format %s chosen (FBO complete + "
                         "GL_LINEAR filterable verified by real draw)\n",
                 fmt->name);
         MP_INFO(mapper, "MKSURF: capability dst imgfmt %s%s\n",
                 mp_imgfmt_to_name(p->dst_imgfmt),
-                exact[i] ? " (exact match)" : " (nearest mpv imgfmt; no exact "
+                exact[idx] ? " (exact match)" : " (nearest mpv imgfmt; no exact "
                                                "match for the GL format)");
         return fmt;
     }
@@ -856,6 +872,10 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
     p->flush_opts = p->flush_opts_cache->opts;
     p->flush_override = -1;
 #if HAVE_ANDROID
+    char lease_fmt[PROP_VALUE_MAX] = {0};
+    if (__system_property_get("debug.mks.st_lease_rgba16", lease_fmt) > 0 &&
+        !strcmp(lease_fmt, "1"))
+        p->lease_rgba16_pref = true;
     char slot_fbo[PROP_VALUE_MAX] = {0};
     if (__system_property_get("debug.mks.st_fbo", slot_fbo) > 0) {
         if (!strcmp(slot_fbo, "0") || !strcmp(slot_fbo, "1")) {
