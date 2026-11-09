@@ -755,8 +755,7 @@ static bool draw_copy(struct ra_hwdec_mapper *mapper, GLuint dst_name,
                                       mapper->src_params.h, w, h,
                                       target_copy,
                                       ok ? "seg" : (measure ? "refused:draw_err" : "none:pre_draw"),
-                                      ok ? fgt_seg : -1,
-                                      ok); }
+                                      ok ? fgt_seg : -1); }
         }
     }
     gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, old_oes);
@@ -1338,6 +1337,17 @@ static void mapper_publish_lease(struct ra_hwdec_mapper *mapper)
     }
 }
 
+// Every actual publish funnels through here (fresh/cur-reuse/retired-reuse/
+// ownership-transfer paths): the frame-timing owner's copies_ok counts real
+// publishes, not draw attempts (a draw can still drop at ref/fence creation).
+static void mkst_publish_accounted(struct ra_hwdec_mapper *mapper)
+{
+    mapper_publish_lease(mapper);
+    { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+      if (fgt && mks_fgt_ready(fgt))
+          mks_fgt_copy_published(fgt); }
+}
+
 // Take a retired lease back as the current mapping for a redraw of a frame
 // whose codec buffer was already released (and possibly retired). Whatever
 // the mapper currently holds is released first.
@@ -1358,7 +1368,7 @@ static void mapper_adopt_retired(struct ra_hwdec_mapper *mapper, int index)
 
     // Ownership of lease (incl. its source ref) transfers to cur.
     p->cur = lease;
-    mapper_publish_lease(mapper);
+    mkst_publish_accounted(mapper);
 }
 
 // Find a free pool slot (not held by cur or any retired lease) and make sure
@@ -1446,7 +1456,7 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     // a) Current lease (defensive: unmap normally runs before every map, so
     //    cur is usually empty here).
     if (p->cur.slot >= 0 && lease_matches(&p->cur, mapper->src)) {
-        mapper_publish_lease(mapper);
+        mkst_publish_accounted(mapper);
         if (p->thermal.enabled) {
             p->thermal.lease_reuse++;
             p->thermal.pts = src_pts;
@@ -1491,7 +1501,7 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     // The reap above cannot create matches (a/b just found none), but a
     // lease serve always beats an idempotent re-release, so verify once more.
     if (p->cur.slot >= 0 && lease_matches(&p->cur, mapper->src)) {
-        mapper_publish_lease(mapper);
+        mkst_publish_accounted(mapper);
         return 0;
     }
     ridx = retired_find(p, mapper->src);
@@ -1720,7 +1730,7 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     if (in_use > (int)p->pool_peak)
         p->pool_peak = in_use;
 
-    mapper_publish_lease(mapper);
+    mkst_publish_accounted(mapper);
 
     MP_INFO(mapper, "MKSURF: frame latch_ts=%"PRIu64"ns src_pts=%.9f delta=%.6fs "
                     "release_count=%"PRIu64" pool=%d/%"PRIu64" fence=%d\n",

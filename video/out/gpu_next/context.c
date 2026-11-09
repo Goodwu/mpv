@@ -33,6 +33,8 @@
 #include <dlfcn.h>
 #endif
 #include "options/m_config.h"
+#include "osdep/timer.h"
+#include "video/out/mks_frame_gpu_timer.h"
 #include "video/out/placebo/utils.h"
 #include "video/out/gpu/video.h"
 
@@ -221,15 +223,24 @@ struct gpu_ctx *gpu_ctx_create(struct vo *vo, struct ra_ctx_opts *ctx_opts)
 #ifdef PL_HAVE_MKS_DISABLE_TIMERS
         // M2' frame-timing owner: freeze the timing mode and disable all LP
         // internal timers when the owner will be active in this context.
+        // The property API is Android-only (P1-2): on other platforms the
+        // owner never arms, so timers stay at the LP default.
         {
+            bool fgt_active = false;
+#if HAVE_ANDROID
             char fgt_mode[PROP_VALUE_MAX] = {0};
-            bool fgt_active = __system_property_get("debug.mks.gpu_timing",
-                                                     fgt_mode) > 0 &&
+            fgt_active = __system_property_get("debug.mks.gpu_timing",
+                                               fgt_mode) > 0 &&
                 (!strcmp(fgt_mode, "frame") || !strcmp(fgt_mode, "frame-span") ||
                  !strcmp(fgt_mode, "frame-count"));
-            params.mks_disable_timers = fgt_active;
             MP_ERR(ctx, "MKS-FGPU-LP-DISABLE prop=%s active=%d\n",
                    fgt_mode[0] ? fgt_mode : "<unset>", fgt_active ? 1 : 0);
+#endif
+            params.mks_disable_timers = fgt_active;
+            // Mutex handshake (P1-3): record the decision on the owner so its
+            // lazy arming cannot diverge from this create-time read.
+            { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+              mks_fgt_set_lp_disable_requested(fgt, fgt_active); }
         }
 #endif
 # if HAVE_EGL

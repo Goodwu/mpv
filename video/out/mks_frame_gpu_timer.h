@@ -25,7 +25,10 @@
 #define MKS_FGT_SLOTS 64
 #define MKS_FGT_MAX_SEGS 8
 #define MKS_FGT_TICKETS 40
+// Horizon for HOL drop; overridable so host tests can build cheap HOLs.
+#ifndef MKS_FGT_HOL_AHEAD
 #define MKS_FGT_HOL_AHEAD 32
+#endif
 #define MKS_FGT_MAX_COPIES 128
 #define MKS_FGT_ELAPSED 0x88BF
 #define MKS_FGT_DISJOINT 0x8FBB
@@ -131,10 +134,22 @@ struct mks_fgt_quarantine {
     unsigned int query;
     int slot;
 };
+// Tracker capacity: overflow falls back to untracked quarantine (design X5:
+// the slot stays in the quarantine family and releases at uninit as
+// rel_uninit_quarantine), never into the ctxlost family. Overridable so host
+// tests can exercise the overflow branch without 32 HOL constructions.
+#ifndef MKS_FGT_QUARANTINE_MAX
 #define MKS_FGT_QUARANTINE_MAX 32
+#endif
 struct mks_fgt_owner {
     bool checked, initialized;
     bool enabled, armed, halted;
+    // Mutex handshake with the LP-disable decision (P1-3): context creation
+    // records whether it passed mks_disable_timers=true to pl_opengl_create
+    // for this context. The owner refuses to arm for frame-family modes
+    // unless this is set, so the two independent property reads cannot
+    // diverge (LP timers enabled while the owner arms).
+    bool lp_disable_requested;
     int mode;
     struct mp_log *log;
     void *context;
@@ -176,6 +191,12 @@ struct mks_fgt_owner {
     void (*emit)(void *ud, const char *line);
     void *emit_ud;
 };
+// LP-disable mutex handshake (P1-3): context creation records its
+// mks_disable_timers decision here; the owner's arming is fail-closed on it.
+static inline void mks_fgt_set_lp_disable_requested(struct mks_fgt_owner *o, bool requested)
+{
+    if (o) o->lp_disable_requested = requested;
+}
 static inline void mks_fgt_line(struct mks_fgt_owner *o, const char *fmt, ...)
 {
     if (!o->emit) return;
@@ -256,20 +277,32 @@ static inline void mks_fgt_halt(struct mks_fgt_owner *o)
 }
 static inline void mks_fgt_disjoint_all(struct mks_fgt_owner *o)
 {
+    // Logic ledger: only ISSUED segs flip to DISJOINT; HOL_DROP is a frozen
+    // logical terminal (design r6) and keeps its tstate — its slot release
+    // lands in the quarantine family (X5) regardless.
     for (int i = 0; i < MKS_FGT_TICKETS; i++) {
         struct mks_fgt_ticket *tk = &o->tickets[i];
         for (int s = 0; s < tk->num_segs; s++) {
             struct mks_fgt_seg *sg = &tk->segs[s];
-            if (!sg->issued) continue;
-            if (sg->tstate != MKS_FGT_TS_ISSUED && sg->tstate != MKS_FGT_TS_HOL_DROP) continue;
+            if (!sg->issued || sg->tstate != MKS_FGT_TS_ISSUED) continue;
             sg->tstate = MKS_FGT_TS_DISJOINT;
             if (sg->slot >= 0 && o->slot_state[sg->slot] == MKS_FGT_S_NORMAL) {
                 o->slot_state[sg->slot] = MKS_FGT_S_FREE; o->rel_disjoint_normal++; o->busy_normal--;
-            } else if (sg->slot >= 0 && o->slot_state[sg->slot] == MKS_FGT_S_QUARANTINE) {
-                o->slot_state[sg->slot] = MKS_FGT_S_FREE; o->rel_disjoint_quarantine++; o->busy_quarantine--;
             }
+            // QUARANTINE slots are handled by the slot-state walk below
+            // (single ownership; covers recycled HOL tickets too).
         }
     }
+    // Resource ledger: free EVERY slot in the quarantine family via the slot
+    // state array — this reaches tracked entries, untracked overflow entries
+    // and entries whose tickets were recycled (invisible to the ticket walk).
+    for (int slot = 0; slot < MKS_FGT_SLOTS; slot++) {
+        if (o->slot_state[slot] == MKS_FGT_S_QUARANTINE) {
+            o->slot_state[slot] = MKS_FGT_S_FREE;
+            o->rel_disjoint_quarantine++; o->busy_quarantine--;
+        }
+    }
+    o->quarantine_count = 0; // all quarantined slots resolved above
 }
 static inline bool mks_fgt_ticket_settled(struct mks_fgt_ticket *tk)
 {
@@ -324,9 +357,23 @@ static inline void mks_fgt_emit_ready(struct mks_fgt_owner *o)
                     tk->segs[s].tstate = MKS_FGT_TS_HOL_DROP;
                     // Quarantine: move slot from normal to quarantine so poll
                     // can still harvest late results (which are discarded).
+                    // The (query, slot) pair must outlive this ticket's recycle,
+                    // so it is appended to the tracker here — the harvest loop
+                    // is the only path that can free a quarantined slot later.
                     if (tk->segs[s].slot >= 0 && o->slot_state[tk->segs[s].slot] == MKS_FGT_S_NORMAL) {
+                        // The slot always enters the quarantine family (design
+                        // X5: hol_drop resources release as rel_late /
+                        // rel_disjoint_quarantine / rel_uninit_quarantine /
+                        // leak_quarantine). Tracker entry is an optimization
+                        // for early harvest; on overflow the slot stays
+                        // untracked-quarantined and releases at uninit.
                         o->slot_state[tk->segs[s].slot] = MKS_FGT_S_QUARANTINE;
                         o->busy_normal--; o->busy_quarantine++;
+                        if (o->quarantine_count < MKS_FGT_QUARANTINE_MAX) {
+                            o->quarantine[o->quarantine_count].query = tk->segs[s].query;
+                            o->quarantine[o->quarantine_count].slot = tk->segs[s].slot;
+                            o->quarantine_count++;
+                        }
                     }
                 }
             }
@@ -362,10 +409,11 @@ static inline void mks_fgt_poll(struct mks_fgt_owner *o)
             sg->tstate = MKS_FGT_TS_RESOLVED; sg->elapsed_ns = ns;
             if (sg->slot >= 0 && o->slot_state[sg->slot] == MKS_FGT_S_NORMAL) {
                 o->slot_state[sg->slot] = MKS_FGT_S_FREE; o->rel_result++; o->busy_normal--;
-            } else if (sg->slot >= 0 && o->slot_state[sg->slot] == MKS_FGT_S_QUARANTINE) {
-                o->slot_state[sg->slot] = MKS_FGT_S_FREE; o->rel_late++; o->busy_quarantine--;
-                o->late_discarded++; sg->elapsed_ns = 0;
             }
+            // S_QUARANTINE slots are owned EXCLUSIVELY by the standalone
+            // tracker (single release); the ticket scan must not touch them,
+            // or a still-allocated HOL ticket and the tracker would both
+            // release the same slot (rel_late double count, busy negative).
         }
     }
     mks_fgt_emit_ready(o);
@@ -592,14 +640,17 @@ static inline void mks_fgt_reinit_notice(struct mks_fgt_owner *o, bool in_ticket
     if (tk && in_ticket) tk->foreign |= MKS_FGT_F_REINIT;
 }
 static inline void mks_fgt_overlay_upload(struct mks_fgt_owner *o) { o->overlay_uploads++; }
-static inline void mks_fgt_copy_record(struct mks_fgt_owner *o, double pts, int sw, int sh, int lw, int lh, bool target_copy, const char *timer, int seg_idx, bool published)
+static inline void mks_fgt_copy_record(struct mks_fgt_owner *o, double pts, int sw, int sh, int lw, int lh, bool target_copy, const char *timer, int seg_idx)
 {
     struct mks_fgt_ticket *tk = mks_fgt_active(o);
     int c_seq = ++o->copy_count;
     int t_seq = tk ? tk->t_seq : 0;
     /* Ring is a bounded diagnostic snapshot; accounting and the C line are
      * unconditional so long rounds keep per-ticket copies_ok and reconcilable
-     * C-line counts after the ring fills. */
+     * C-line counts after the ring fills. copies_ok is NOT incremented here:
+     * the draw outcome is not the publish outcome (mp_image_new_ref /
+     * fence_create can still fail later) — the mapper reports the real
+     * publish result via mks_fgt_copy_published(). */
     if (o->copy_next < MKS_FGT_MAX_COPIES) {
         struct mks_fgt_copy_rec *c = &o->copies[o->copy_next++];
         memset(c, 0, sizeof(*c));
@@ -607,10 +658,17 @@ static inline void mks_fgt_copy_record(struct mks_fgt_owner *o, double pts, int 
         c->src_w = sw; c->src_h = sh; c->lease_w = lw; c->lease_h = lh;
         c->target_copy = target_copy; snprintf(c->timer, sizeof(c->timer), "%s", timer); c->seg_ref = seg_idx;
     }
-    if (tk && seg_idx >= 0 && published) tk->copies_ok++;
     mks_fgt_line(o, "MKS-FGPU-C session=%s c=%d t=%d pts=%.9f src=%dx%d lease=%dx%d tc=%d timer=%s seg=%d",
         o->session, c_seq, t_seq, pts, sw, sh, lw, lh, target_copy?1:0, timer, seg_idx);
     o->copy_emitted++;
+}
+// Publish outcome: called by the mapper exactly when the lease is actually
+// published (ref + fence created, mapper_publish_lease reached). A draw that
+// later drops never calls this, so copies_ok == published copies per ticket.
+static inline void mks_fgt_copy_published(struct mks_fgt_owner *o)
+{
+    struct mks_fgt_ticket *tk = mks_fgt_active(o);
+    if (tk) tk->copies_ok++;
 }
 static inline void mks_fgt_summary(struct mks_fgt_owner *o)
 {
@@ -695,7 +753,12 @@ static inline void mks_fgt_uninit(struct mks_fgt_owner *o)
         o->busy_normal = o->busy_quarantine = o->busy_ctxlost = 0;
         o->fgt.delete_queries(MKS_FGT_SLOTS, o->ids); o->gl_deleted = MKS_FGT_SLOTS;
     } else {
-        o->leak_ctxlost += o->busy_ctxlost; o->leak_quarantine += o->busy_quarantine;
+        // Wrong-context uninit: no slot can ever be released, so every busy
+        // category folds into leaks and zeroes — the FINAL ledger keeps
+        // busy_* at 0 and the bind equation single-counts each resource.
+        o->leak_ctxlost += o->busy_ctxlost + o->busy_normal;
+        o->leak_quarantine += o->busy_quarantine;
+        o->busy_normal = o->busy_quarantine = o->busy_ctxlost = 0;
         o->gl_leaked = MKS_FGT_SLOTS;
     }
     mks_fgt_summary(o);
@@ -708,6 +771,19 @@ static inline void mks_fgt_uninit(struct mks_fgt_owner *o)
 // Lazy init guard: call this before any enabled/armed check. On the first
 // call, reads the mode property and initializes (by which time the EGL
 // context is current because the caller is already doing GL work).
+// Mutex contract: a frame-family owner must not arm unless context creation
+// disabled the LP internal timers for this context (the same frozen property,
+// read at pl_opengl_create time and recorded via mks_fgt_set_lp_disable_requested).
+static inline void mks_fgt_enforce_lp_mutex(struct mks_fgt_owner *o)
+{
+    if (o->mode != MKS_FGT_MODE_OFF && !o->lp_disable_requested) {
+        o->enabled = false;
+        o->armed = false;
+        // Explicit reject evidence (R2-P2-1): the contradictory armed=1 INIT
+        // is answered by an on-log rejection line.
+        mks_fgt_line(o, "MKS-FGPU-REJECT reason=lp-not-disabled");
+    }
+}
 #ifdef __ANDROID__
 static inline bool mks_fgt_ready(struct mks_fgt_owner *o)
 {
@@ -723,7 +799,19 @@ static inline bool mks_fgt_ready(struct mks_fgt_owner *o)
         o->fgt.get_current_context = (void *)eglGetCurrentContext;
         char mode[PROP_VALUE_MAX + 1] = {0};
         __system_property_get("debug.mks.gpu_timing", mode);
+        // R2-P2-1: reject BEFORE init so no armed=1 INIT is emitted for a
+        // session the mutex would immediately disarm.
+        bool frame_family = !strcmp(mode, "frame") || !strcmp(mode, "frame-span") ||
+                            !strcmp(mode, "frame-count");
+        if (frame_family && !o->lp_disable_requested) {
+            o->checked = true;
+            o->enabled = false;
+            o->armed = false;
+            mks_fgt_line(o, "MKS-FGPU-REJECT reason=lp-not-disabled mode=%s", mode);
+            return false;
+        }
         mks_fgt_init(o, NULL, mode, NULL, NULL, eglGetCurrentContext);
+        mks_fgt_enforce_lp_mutex(o);
     }
     return o->enabled && o->armed;
 }
