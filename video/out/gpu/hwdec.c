@@ -130,7 +130,14 @@ bool ra_hwdec_test_format(struct ra_hwdec *hwdec, int imgfmt)
 struct ra_hwdec_mapper *ra_hwdec_mapper_create(struct ra_hwdec *hwdec,
                                                const struct mp_image_params *params)
 {
+    return ra_hwdec_mapper_create_with_caps(hwdec, params, 0);
+}
+
+struct ra_hwdec_mapper *ra_hwdec_mapper_create_with_caps(
+    struct ra_hwdec *hwdec, const struct mp_image_params *params, unsigned int caps)
+{
     mp_assert(ra_hwdec_test_format(hwdec, params->imgfmt));
+    mp_assert(!(caps & ~RA_HWDEC_CAP_MAP_GEOMETRY));
 
     struct ra_hwdec_mapper *mapper = talloc_ptrtype(NULL, mapper);
     *mapper = (struct ra_hwdec_mapper){
@@ -141,6 +148,7 @@ struct ra_hwdec_mapper *ra_hwdec_mapper_create(struct ra_hwdec *hwdec,
         .priv = talloc_zero_size(mapper, hwdec->driver->mapper->priv_size),
         .src_params = *params,
         .dst_params = *params,
+        .caps = caps,
     };
     if (mapper->driver->init(mapper) < 0)
         ra_hwdec_mapper_free(&mapper);
@@ -163,15 +171,32 @@ void ra_hwdec_mapper_unmap(struct ra_hwdec_mapper *mapper)
     if (mapper->driver->unmap)
         mapper->driver->unmap(mapper);
 
+    mapper->map_geometry = (struct ra_hwdec_map_geometry){0};
+    mapper->map_request = (struct ra_hwdec_map_request){0};
     // Clean up after the image if the mapper didn't already
     mp_image_unrefp(&mapper->src);
 }
 
 int ra_hwdec_mapper_map(struct ra_hwdec_mapper *mapper, struct mp_image *img)
 {
+    return ra_hwdec_mapper_map_with_request(mapper, img, NULL);
+}
+
+int ra_hwdec_mapper_map_with_request(struct ra_hwdec_mapper *mapper,
+                                    struct mp_image *img,
+                                    const struct ra_hwdec_map_request *request)
+{
     ra_hwdec_mapper_unmap(mapper);
+    if (request && (mapper->caps & RA_HWDEC_CAP_MAP_GEOMETRY))
+        mapper->map_request = *request;
     mp_image_setrefp(&mapper->src, img);
-    if (mapper->driver->map(mapper) < 0) {
+    if (!mapper->src) {
+        mapper->map_request = (struct ra_hwdec_map_request){0};
+        return -1;
+    }
+    int result = mapper->driver->map(mapper);
+    mapper->map_request = (struct ra_hwdec_map_request){0};
+    if (result < 0) {
         ra_hwdec_mapper_unmap(mapper);
         return -1;
     }

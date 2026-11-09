@@ -18,6 +18,7 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <dlfcn.h>
+#include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include <pthread.h>
@@ -30,6 +31,12 @@
 #include "utils.h"
 #include "mks_yuv_compare.h"
 #include "video/out/mks_thermal.h"
+#include "video/out/mks_frame_gpu_timer.h"
+
+// M2' frame GPU timing owner: single definition (extern linkage)
+#if HAVE_EGL_ANDROID
+struct mks_fgt_owner *mks_fgt_global;
+#endif
 #include "video/out/mks_gpu_timer.h"
 
 // ---------------------------------------------------------------------------
@@ -124,6 +131,14 @@ struct priv {
     bool capture_owner_live;
     struct mks_thermal_trace thermal;
     struct mks_gpu_timer gpu_yuv_timer;
+    struct mks_fgt_owner fgt_owner;
+    // M2' frame GPU timing owner device-side log channel: the full-rate
+    // MKS-FGPU-* stream starves the lab probe's Dart timers when routed
+    // through logcat (whole-round flood), so the authoritative transport is
+    // this file (path from debug.mks.fgpu_log, pulled by the round tool);
+    // only INIT/S/FINAL markers keep the mp_msg view.
+    FILE *fgt_log;
+    bool fgt_log_failed;
     // Default-off experiment. Commit is consumed once, immediately at swap.
     bool fusion_checked, fusion_enabled, fusion_committed, fusion_rgb_ready;
     // Per-draw receipt bookkeeping for the swap gate (see yuv_fusion_begin).
@@ -954,7 +969,12 @@ static void yuv_diag_final_pass(struct ra_ctx *ctx)
                             capture->roi.w, capture->roi.h);
     bool timed = mks_gpu_timer_begin(&p->gpu_yuv_timer, gl, ctx->log,
                                      "final-yuv", NAN);
+    struct mks_fgt_owner *fgt = mks_fgt_get_global();
+    if (fgt && mks_fgt_ready(fgt))
+        mks_fgt_final_begin(fgt);
     gl->DrawArrays(GL_TRIANGLES, 0, 3);
+    if (fgt && mks_fgt_ready(fgt))
+        mks_fgt_final_end(fgt);
     mks_gpu_timer_end(&p->gpu_yuv_timer, timed);
     if (capturing) {
         gl->MemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
@@ -1773,7 +1793,17 @@ static void android_swap_buffers(struct ra_ctx *ctx)
             MP_ERR(ctx, "YUV-DIAG: swap with final-pass ready=false (#%d); "
                    "committing without the final pass\n", p->yuv.notready_swaps);
     }
+    { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+      if (fgt && mks_fgt_ready(fgt)) mks_fgt_swap_issue(fgt); }
+    { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+      if (fgt && fgt->enabled && fgt->armed) {
+          if (p->capture.id)
+              mks_fgt_bypass(fgt, MKS_FGT_F_COMPARE, "compare", true);
+      } }
     bool swapped = eglSwapBuffers(p->egl_display, p->egl_surface);
+    { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+      if (fgt && mks_fgt_ready(fgt))
+          mks_fgt_swap_result(fgt, swapped, 0, p->capture.id != 0); }
     if (p->capture.id) {
         p->capture.swap_succeeded = swapped;
         if (!swapped) p->capture.status = MKS_YUV_COMPARE_FAILED;
@@ -1806,6 +1836,11 @@ static void android_uninit(struct ra_ctx *ctx)
     yuv_fusion_invalidate(p);
     mks_android_yuv_compare_cancel(ctx);
     mks_gpu_timer_uninit(&p->gpu_yuv_timer);
+    mks_fgt_uninit(&p->fgt_owner);
+    if (p->fgt_log) {
+        fclose(p->fgt_log);
+        p->fgt_log = NULL;
+    }
     mks_thermal_report(&p->thermal, true);
     // Hook teardown: restore the producer entry points at the context
     // teardown boundary (the hook lives for the context lifetime).
@@ -1831,10 +1866,47 @@ static void android_uninit(struct ra_ctx *ctx)
     vo_android_uninit(ctx->vo);
 }
 
+// M2' frame GPU timing owner: emit callback. Full-rate lines go to the
+// device-side file channel (debug.mks.fgpu_log); the logcat view keeps only
+// the INIT/S/FINAL markers so the lab app's probe timers survive the flood.
+static void mks_fgt_emit_cb(void *ud, const char *line)
+{
+    struct ra_ctx *ctx = ud;
+    struct priv *p = ctx->priv;
+    if (!p->fgt_log && !p->fgt_log_failed) {
+        char path[PROP_VALUE_MAX];
+        if (__system_property_get("debug.mks.fgpu_log", path) > 0) {
+            p->fgt_log = fopen(path, "a");
+            if (p->fgt_log) {
+                setvbuf(p->fgt_log, NULL, _IOLBF, 0);
+                MP_ERR(ctx, "MKS-FGPU-LOG file channel: %s\n", path);
+            } else {
+                p->fgt_log_failed = true;
+                MP_ERR(ctx, "MKS-FGPU-LOG fopen failed: %s\n", path);
+            }
+        } else {
+            p->fgt_log_failed = true;
+        }
+    }
+    if (p->fgt_log) {
+        fprintf(p->fgt_log, "%s\n", line);
+    }
+    if (strncmp(line, "MKS-FGPU-INIT", 13) == 0 ||
+        strncmp(line, "MKS-FGPU-S ", 11) == 0 ||
+        strncmp(line, "MKS-FGPU-FINAL", 14) == 0)
+        mp_msg(ctx->log, MSGL_ERR, "%s\n", line);
+}
+
 static bool android_init(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
     mks_thermal_init(&p->thermal, ctx->log, "yuv", p);
+    // M2' frame GPU timing owner: set_global + wire emit callback; lazy
+    // init happens at first use (mks_fgt_ready) when the EGL context is
+    // current.
+    p->fgt_owner.emit = mks_fgt_emit_cb;
+    p->fgt_owner.emit_ud = ctx;
+    mks_fgt_set_global(&p->fgt_owner);
 
     if (!vo_android_init(ctx->vo))
         goto fail;

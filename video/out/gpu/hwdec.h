@@ -49,6 +49,28 @@ struct ra_hwdec {
     float overlay_colorkey[4];
 };
 
+// Optional, restricted mapping of a complete logical source frame to a 2D
+// texture. The actual allocation size remains authoritative in tex[0]. This
+// does not describe arbitrary padding, rotation or multi-plane mappings.
+struct ra_hwdec_map_geometry {
+    bool valid;
+    int logical_w, logical_h;
+    struct mp_rect logical_rect;
+    struct mp_rect mapped_rect;
+};
+
+// Applies to creation of a fresh copy, not to existing cur/retired leases.
+// A consumer must inspect the published geometry even when no scale is
+// requested: an earlier smaller copy cannot be restored to source detail.
+struct ra_hwdec_map_request {
+    bool allow_full_frame_scale;
+    int target_w, target_h;
+};
+
+enum ra_hwdec_mapper_caps {
+    RA_HWDEC_CAP_MAP_GEOMETRY = 1 << 0,
+};
+
 struct ra_hwdec_mapper {
     const struct ra_hwdec_mapper_driver *driver;
     struct mp_log *log;
@@ -58,8 +80,19 @@ struct ra_hwdec_mapper {
     // Input frame parameters. (Set before init(), immutable.)
     struct mp_image_params src_params;
     // Output frame parameters (represents the format the textures return). Must
-    // be set by init(), immutable afterwards,
+    // be set by init(), immutable afterwards. A consumer opting into map
+    // geometry must use map_geometry and tex[0] for each physical mapping;
+    // dst_params geometry then describes the static logical frame instead.
     struct mp_image_params dst_params;
+
+    // Consumer capabilities are fixed before init. Request is visible only
+    // during driver->map; geometry is valid only after successful map and
+    // until unmap. Drivers that do not publish geometry leave it invalid;
+    // then the consumer must retain the original mapping contract. Consumers
+    // without the capability always retain the original contract.
+    unsigned int caps;
+    struct ra_hwdec_map_request map_request;
+    struct ra_hwdec_map_geometry map_geometry;
 
     // The currently mapped source image (or the image about to be mapped in
     // ->map()). NULL if unmapped. The mapper can also clear this reference if
@@ -146,9 +179,14 @@ bool ra_hwdec_test_format(struct ra_hwdec *hwdec, int imgfmt);
 
 struct ra_hwdec_mapper *ra_hwdec_mapper_create(struct ra_hwdec *hwdec,
                                                const struct mp_image_params *params);
+struct ra_hwdec_mapper *ra_hwdec_mapper_create_with_caps(
+    struct ra_hwdec *hwdec, const struct mp_image_params *params, unsigned int caps);
 void ra_hwdec_mapper_free(struct ra_hwdec_mapper **mapper);
 void ra_hwdec_mapper_unmap(struct ra_hwdec_mapper *mapper);
 int ra_hwdec_mapper_map(struct ra_hwdec_mapper *mapper, struct mp_image *img);
+int ra_hwdec_mapper_map_with_request(struct ra_hwdec_mapper *mapper,
+                                    struct mp_image *img,
+                                    const struct ra_hwdec_map_request *request);
 
 // Get the primary image format for the given driver name.
 // Returns IMGFMT_NONE if the name doesn't get matched.

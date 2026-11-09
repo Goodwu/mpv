@@ -43,6 +43,7 @@
 #include "video/fmt-conversion.h"
 #include "video/mp_image.h"
 #include "video/out/placebo/ra_pl.h"
+#include "video/out/mks_frame_gpu_timer.h"
 #include "placebo/utils.h"
 #include "gpu/context.h"
 #include "gpu/hwdec.h"
@@ -520,6 +521,14 @@ struct frame_priv {
     struct osd_state subs;
     uint64_t osd_sync;
     struct ra_hwdec *hwdec;
+    // Physical lease dims recorded at acquire after the published per-map
+    // geometry verified as a full-frame, orientation-free target-size lease.
+    // 0 keeps every consumer in the classic factor-1 source space.
+    int lease_w, lease_h;
+    // Acquire-local rescaled overlay copies (target-size leases only),
+    // freed again by the matching release. The queue frame and the shared
+    // subtitle state are never mutated.
+    void *rescale_ctx;
 };
 
 static int plane_data_from_imgfmt(struct pl_plane_data out_data[4],
@@ -630,7 +639,8 @@ static bool hwdec_reconfig(struct priv *p, struct ra_hwdec *hwdec,
         }
     }
 
-    p->hwdec_mapper = ra_hwdec_mapper_create(hwdec, par);
+    p->hwdec_mapper = ra_hwdec_mapper_create_with_caps(
+        hwdec, par, RA_HWDEC_CAP_MAP_GEOMETRY);
     if (!p->hwdec_mapper) {
         MP_ERR(p, "Initializing texture for hardware decoding failed.\n");
         return NULL;
@@ -692,24 +702,191 @@ static pl_tex hwdec_get_tex(struct priv *p, int n)
     return false;
 }
 
+// Scale one crop-relative overlay endpoint by the fixed crop's effective
+// ratio, snapping zero and full-span endpoints exactly. Interior endpoints
+// keep float precision: the renderer maps them proportionally, and
+// unconditional rounding could collapse legal thin parts to zero width.
+static float hwdec_scale_overlay_endpoint(float q, float old_extent,
+                                          float new_extent, double ratio)
+{
+    if (q == 0.0f)
+        return 0.0f;
+    if (q == old_extent)
+        return new_extent;
+    return (float)(q * ratio);
+}
+
+// The renderer samples this acquire-local frame copy: bring its crop and its
+// video-space overlay parts from logical source space into the verified
+// physical lease space. The queue frame keeps classic source-space geometry,
+// and the shared subtitle state is never mutated: scaled copies are allocated
+// per acquire and freed by the matching release. Frames without a verified
+// scaled lease (factor 1, oriented frames) are left unchanged.
+static void hwdec_lease_rescale_frame(struct priv *p, struct mp_image *mpi,
+                                      struct pl_frame *frame)
+{
+    struct frame_priv *fp = mpi->priv;
+    if (!fp->lease_w || !fp->lease_h || mpi->params.w < 1 || mpi->params.h < 1 ||
+        mpi->params.rotate || mpi->params.vflip)
+        return;
+
+    double sx = (double)fp->lease_w / mpi->params.w;
+    double sy = (double)fp->lease_h / mpi->params.h;
+    struct pl_rect2df old = frame->crop;
+    frame->crop = (struct pl_rect2df) {
+        .x0 = old.x0 == 0 ? 0.0 : (float)lrint(old.x0 * sx),
+        .y0 = old.y0 == 0 ? 0.0 : (float)lrint(old.y0 * sy),
+        .x1 = old.x1 == mpi->params.w ? fp->lease_w : (float)lrint(old.x1 * sx),
+        .y1 = old.y1 == mpi->params.h ? fp->lease_h : (float)lrint(old.y1 * sy),
+    };
+    // A legal non-empty source crop must not collapse under rounding: the
+    // overlay layout divides by its extent, and libplacebo re-defaults a
+    // zero crop to the full texture.
+    if (old.x1 > old.x0 && frame->crop.x1 <= frame->crop.x0) {
+        frame->crop.x1 = MPMIN(frame->crop.x0 + 1, (float)fp->lease_w);
+        frame->crop.x0 = frame->crop.x1 - 1;
+    }
+    if (old.y1 > old.y0 && frame->crop.y1 <= frame->crop.y0) {
+        frame->crop.y1 = MPMIN(frame->crop.y0 + 1, (float)fp->lease_h);
+        frame->crop.y0 = frame->crop.y1 - 1;
+    }
+
+    if (!frame->num_overlays)
+        return;
+    // The renderer maps SRC_CROP overlays through the *fixed* crop extent,
+    // so video-space parts must follow the crop's effective scale rather
+    // than the raw lease ratio; rounded or collapse-fixed crops would
+    // otherwise shift part proportions relative to the video.
+    float old_ex = old.x1 - old.x0, old_ey = old.y1 - old.y0;
+    float new_ex = frame->crop.x1 - frame->crop.x0;
+    float new_ey = frame->crop.y1 - frame->crop.y0;
+    double px = old_ex != 0.0f ? (double)new_ex / (double)old_ex : sx;
+    double py = old_ey != 0.0f ? (double)new_ey / (double)old_ey : sy;
+    // The talloc wrappers abort on OOM; there is no partial-failure path.
+    void *ctx = talloc_new(p);
+    struct pl_overlay *ols = talloc_array(ctx, struct pl_overlay,
+                                          frame->num_overlays);
+    for (int n = 0; n < frame->num_overlays; n++) {
+        const struct pl_overlay *ol = &frame->overlays[n];
+        // Only video-space overlays move with the sampled crop; DST_CROP
+        // parts are already in target space and must be copied verbatim.
+        bool video_space = ol->coords == PL_OVERLAY_COORDS_SRC_CROP;
+        struct pl_overlay_part *parts =
+            talloc_array(ctx, struct pl_overlay_part, ol->num_parts);
+        for (int i = 0; i < ol->num_parts; i++) {
+            parts[i] = ol->parts[i];
+            if (!video_space)
+                continue;
+            // Video-relative layout scales with the sampled space; the
+            // subtitle atlas coordinates in part.src must not change.
+            parts[i].dst.x0 = hwdec_scale_overlay_endpoint(parts[i].dst.x0,
+                                                           old_ex, new_ex, px);
+            parts[i].dst.x1 = hwdec_scale_overlay_endpoint(parts[i].dst.x1,
+                                                           old_ex, new_ex, px);
+            parts[i].dst.y0 = hwdec_scale_overlay_endpoint(parts[i].dst.y0,
+                                                           old_ey, new_ey, py);
+            parts[i].dst.y1 = hwdec_scale_overlay_endpoint(parts[i].dst.y1,
+                                                           old_ey, new_ey, py);
+        }
+        ols[n] = *ol;
+        ols[n].parts = parts;
+    }
+    frame->overlays = ols;
+    fp->rescale_ctx = ctx;
+}
+
 static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
 {
     struct mp_image *mpi = frame->user_data;
     struct frame_priv *fp = mpi->priv;
     struct priv *p = fp->vo->priv;
-    if (!hwdec_reconfig(p, fp->hwdec, &mpi->params))
-        return false;
+    { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+      if (fgt && mks_fgt_ready(fgt)) mks_fgt_suspend(fgt, MKS_FGT_SUSP_ACQ); }
 
-    if (ra_hwdec_mapper_map(p->hwdec_mapper, mpi) < 0) {
+    // Any failure or replacement below must not leave a stale lease marker
+    // from an earlier acquire of the same frame.
+    fp->lease_w = fp->lease_h = 0;
+
+    if (!hwdec_reconfig(p, fp->hwdec, &mpi->params)) {
+    { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+      if (fgt && mks_fgt_ready(fgt)) mks_fgt_resume(fgt, MKS_FGT_SUSP_ACQ); }
+        return false;
+    }
+
+    // Offer the current display size as the fresh-copy target. The mapper
+    // gates the diagnostic property, geometry and uniform-scale conditions
+    // itself; existing cur/retired leases are published with their own
+    // geometry regardless of the request.
+    struct ra_hwdec_map_request req = {
+        .allow_full_frame_scale = true,
+        .target_w = fp->vo->dwidth,
+        .target_h = fp->vo->dheight,
+    };
+    const struct ra_hwdec_map_request *reqp =
+        req.target_w > 0 && req.target_h > 0 ? &req : NULL;
+    if (ra_hwdec_mapper_map_with_request(p->hwdec_mapper, mpi, reqp) < 0) {
         MP_ERR(p, "Mapping hardware decoded surface failed.\n");
+    { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+      if (fgt && mks_fgt_ready(fgt)) mks_fgt_resume(fgt, MKS_FGT_SUSP_ACQ); }
         return false;
     }
 
     for (int n = 0; n < frame->num_planes; n++) {
-        if (!(frame->planes[n].texture = hwdec_get_tex(p, n)))
+        if (!(frame->planes[n].texture = hwdec_get_tex(p, n))) {
+    { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+      if (fgt && mks_fgt_ready(fgt)) mks_fgt_resume(fgt, MKS_FGT_SUSP_ACQ); }
             return false;
+        }
     }
 
+    // Verify the published per-map geometry before any consumer relies on
+    // it. A scaled lease must be a full logical frame stored over the full
+    // physical texture, downsample-only, with no orientation; drivers that
+    // never publish geometry keep the classic behavior. Contradictions fail
+    // closed.
+    const struct ra_hwdec_map_geometry *g = &p->hwdec_mapper->map_geometry;
+    if ((p->hwdec_mapper->caps & RA_HWDEC_CAP_MAP_GEOMETRY) && g->valid) {
+        pl_tex tex0 = frame->planes[0].texture;
+        bool full_logical = g->logical_w == mpi->params.w &&
+                            g->logical_h == mpi->params.h &&
+                            g->logical_rect.x0 == 0 && g->logical_rect.y0 == 0 &&
+                            g->logical_rect.x1 == mpi->params.w &&
+                            g->logical_rect.y1 == mpi->params.h;
+        bool oriented = mpi->params.rotate || mpi->params.vflip;
+        if (!tex0 || !full_logical ||
+            tex0->params.w < 1 || tex0->params.h < 1 ||
+            g->mapped_rect.x0 != 0 || g->mapped_rect.y0 != 0 ||
+            g->mapped_rect.x1 != tex0->params.w ||
+            g->mapped_rect.y1 != tex0->params.h ||
+            g->mapped_rect.x1 > mpi->params.w || g->mapped_rect.y1 > mpi->params.h ||
+            (oriented && (tex0->params.w != mpi->params.w ||
+                          tex0->params.h != mpi->params.h)))
+        {
+            MP_ERR(p, "Unexpected hwdec lease geometry: logical %dx%d rect "
+                      "%d,%d,%d,%d mapped rect %d,%d,%d,%d tex %dx%d src %dx%d.\n",
+                   g->logical_w, g->logical_h,
+                   g->logical_rect.x0, g->logical_rect.y0,
+                   g->logical_rect.x1, g->logical_rect.y1,
+                   g->mapped_rect.x0, g->mapped_rect.y0,
+                   g->mapped_rect.x1, g->mapped_rect.y1,
+                   tex0 ? tex0->params.w : 0, tex0 ? tex0->params.h : 0,
+                   mpi->params.w, mpi->params.h);
+    { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+      if (fgt && mks_fgt_ready(fgt)) mks_fgt_resume(fgt, MKS_FGT_SUSP_ACQ); }
+            return false;
+        }
+        if (tex0->params.w != mpi->params.w || tex0->params.h != mpi->params.h) {
+            fp->lease_w = tex0->params.w;
+            fp->lease_h = tex0->params.h;
+        }
+    }
+
+    // The renderer samples this local copy: move its crop and video-space
+    // overlays into the verified physical space. Runs last so that no
+    // failure path below can leave half-rescaled state behind.
+    hwdec_lease_rescale_frame(p, mpi, frame);
+    { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+      if (fgt && mks_fgt_ready(fgt)) mks_fgt_resume(fgt, MKS_FGT_SUSP_ACQ); }
     return true;
 }
 
@@ -718,12 +895,23 @@ static void hwdec_release(pl_gpu gpu, struct pl_frame *frame)
     struct mp_image *mpi = frame->user_data;
     struct frame_priv *fp = mpi->priv;
     struct priv *p = fp->vo->priv;
+    { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+      if (fgt && mks_fgt_ready(fgt)) mks_fgt_suspend(fgt, MKS_FGT_SUSP_REL); }
+    // Free the acquire-local rescaled overlay copies before any early return.
+    if (fp->rescale_ctx) {
+        talloc_free(fp->rescale_ctx);
+        fp->rescale_ctx = NULL;
+    }
+    if (!p->hwdec_mapper)
+        return;
     if (!ra_pl_get(p->hwdec_mapper->ra)) {
         for (int n = 0; n < frame->num_planes; n++)
             pl_tex_destroy(p->gpu, &frame->planes[n].texture);
     }
 
     ra_hwdec_mapper_unmap(p->hwdec_mapper);
+    { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+      if (fgt && mks_fgt_ready(fgt)) mks_fgt_resume(fgt, MKS_FGT_SUSP_REL); }
 }
 
 static bool format_supported(struct vo *vo, int format, bool use_uint)
@@ -1218,6 +1406,11 @@ static uint64_t fusion_frame_rejects(struct vo *vo, const struct vo_frame *frame
         REJECT(32, image->num_overlays || image->rotation || image->lut);
         REJECT(33, image->repr.alpha == PL_ALPHA_INDEPENDENT ||
                    image->repr.alpha == PL_ALPHA_PREMULTIPLIED);
+        // Logical full-frame eligibility, checked in source space against the
+        // queue frame's crop. The queue frame always keeps classic
+        // source-space geometry; the physical full-frame property of a scaled
+        // lease is enforced fail-closed by the mapper gate and the acquire
+        // geometry verification, not here.
         REJECT(34, !mpi || !fusion_full_rect(image->crop, mpi->w, mpi->h));
     }
 #undef REJECT
@@ -2483,7 +2676,11 @@ static bool fusion_render(struct vo *vo, const struct vo_frame *frame,
     uint64_t table_serial_before = p->fusion_table_was_enabled
         ? pl_opengl_uv_atlas_table_pass_serial(p->gpu) : 0;
 #endif
+    { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+      if (fgt && mks_fgt_ready(fgt)) mks_fgt_render_begin(fgt, 1); }
     bool rendered = pl_render_image_mix(p->rr, mix, &fused, params);
+    { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+      if (fgt && mks_fgt_ready(fgt)) mks_fgt_render_end(fgt, rendered); }
 #if defined(PL_HAVE_MKS_UV_ATLAS_READ)
     if (rendered && p->fusion_table_was_enabled &&
         !p->compare_requested && !p->compare_started && !p->compare_active &&
@@ -2889,6 +3086,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     }
 #endif
     bool should_draw = sw->fns->start_frame(sw, NULL); // for wayland logic
+    { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+      if (fgt && fgt->enabled && fgt->armed && should_draw)
+          mks_fgt_ticket_open(fgt, frame->current ? frame->current->pts : 0,
+                              frame->frame_id, 1, 1, MKS_FGT_ROUTE_FUSED); }
     if (!should_draw || !pl_swapchain_start_frame(p->sw, &swframe)) {
         if (frame->current) {
             // Advance the queue state to the current PTS to discard unused frames
@@ -3023,6 +3224,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             struct pl_frame *image = (struct pl_frame *) mix.frames[i];
             struct mp_image *mpi = image->user_data;
             struct frame_priv *fp = mpi->priv;
+            // The queue frame always carries classic source-space geometry;
+            // the renderer's acquire moves its own local copy into the
+            // verified physical lease space (hwdec_lease_rescale_frame).
             apply_crop(image, p->src, vo->params->w, vo->params->h);
             if (opts->blend_subs) {
                 if (frame->redraw)
@@ -3183,7 +3387,11 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         if (fusion_available)
             rgb_epoch_valid = pl_opengl_error_epoch(gpu, &rgb_error_epoch);
 #endif
+        { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+          if (fgt && mks_fgt_ready(fgt)) mks_fgt_render_begin(fgt, 2); }
         bool rendered = pl_render_image_mix(p->rr, &mix, &target, &params);
+        { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+          if (fgt && mks_fgt_ready(fgt)) mks_fgt_render_end(fgt, rendered); }
 #if defined(PL_HAVE_MKS_UV_ATLAS_READ)
         if (!rendered && p->fusion_table_state == FT_SEEDING) {
             // The seed anchor transaction rides inside this render's final
@@ -3204,7 +3412,11 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
                 if (fusion_available)
                     rgb_epoch_valid = pl_opengl_error_epoch(gpu, &rgb_error_epoch);
 #endif
+                { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+                  if (fgt && mks_fgt_ready(fgt)) mks_fgt_render_begin(fgt, 3); }
                 rendered = pl_render_image_mix(p->rr, &mix, &target, &params);
+                { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+                  if (fgt && mks_fgt_ready(fgt)) mks_fgt_render_end(fgt, rendered); }
                 if (rendered)
                     MP_ERR(vo, "MKS-FUSION-TABLE event=seed-frame-salvaged\n");
             }
@@ -3338,10 +3550,16 @@ static void flip_page(struct vo *vo)
         if (p->thermal.enabled)
             p->thermal.submit++;
         bool submitted = pl_swapchain_submit_frame(p->sw);
+        { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+          if (fgt && mks_fgt_ready(fgt)) mks_fgt_submit_result(fgt, submitted); }
         p->compare_frame_open = false;
         p->frame_pending = false;
+        // B2: flip_close NOT called here — swap_result in android_swap_buffers
+        // handles the presentation axis for the successful submit path.
         if (!submitted) {
             MP_ERR(vo, "Failed presenting frame!\n");
+            { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+              if (fgt && mks_fgt_ready(fgt)) mks_fgt_flip_close(fgt, true, false, false); }
             if ((p->fusion_presentation_guard || p->fusion_frame_trace) &&
                 p->ra_ctx->fns->yuv_fusion_abort)
                 p->ra_ctx->fns->yuv_fusion_abort(p->ra_ctx);
@@ -3474,6 +3692,7 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
     pl_options pars = p->pars;
     pl_gpu gpu = p->gpu;
     pl_tex fbo = NULL;
+    struct osd_state screenshot_osd = {0};
     args->res = NULL;
 
     update_options(vo);
@@ -3606,6 +3825,8 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
         target.color.transfer = PL_COLOR_TRC_GAMMA22;
     }
 
+    // The queue-frame crop stays in classic source space; the renderer's
+    // acquire moves its own local copy into the verified physical space.
     apply_crop(&image, src, mpi->params.w, mpi->params.h);
     apply_crop(&target, dst, fbo->params.w, fbo->params.h);
     update_tm_viz(&pars->color_map_params, &target);
@@ -3616,7 +3837,6 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
     if (!args->osd)
         osd_flags |= OSD_DRAW_SUB_ONLY;
 
-    struct frame_priv *fp = mpi->priv;
     if (opts->blend_subs) {
         float w = pl_rect_w(opts->blend_subs == BLEND_SUBS_VIDEO ? image.crop : target.crop);
         float h = pl_rect_h(opts->blend_subs == BLEND_SUBS_VIDEO ? image.crop : target.crop);
@@ -3634,11 +3854,11 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
         enum pl_overlay_coords rel = opts->blend_subs == BLEND_SUBS_VIDEO
             ? PL_OVERLAY_COORDS_SRC_CROP : PL_OVERLAY_COORDS_DST_CROP;
         update_overlays(vo, res, osd_flags,
-                        rel, &fp->subs, &image, mpi);
+                        rel, &screenshot_osd, &image, mpi);
     } else {
         // Disable overlays when blend_subs is disabled
         update_overlays(vo, osd, osd_flags, PL_OVERLAY_COORDS_DST_FRAME,
-                        &p->osd_state, &target, mpi);
+                        &screenshot_osd, &target, mpi);
         image.num_overlays = 0;
     }
 
@@ -3669,6 +3889,10 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
 
     // fall through
 done:
+    for (size_t i = 0; i < MP_ARRAY_SIZE(screenshot_osd.entries); i++) {
+        pl_tex_destroy(gpu, &screenshot_osd.entries[i].tex);
+        talloc_free(screenshot_osd.entries[i].parts);
+    }
     pl_tex_destroy(gpu, &fbo);
 }
 

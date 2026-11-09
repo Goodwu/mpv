@@ -218,6 +218,20 @@ struct gpu_ctx *gpu_ctx_create(struct vo *vo, struct ra_ctx_opts *ctx_opts)
             .get_proc_addr_ex = (void *) gl->get_fn,
             .proc_ctx = gl->fn_ctx,
         );
+#ifdef PL_HAVE_MKS_DISABLE_TIMERS
+        // M2' frame-timing owner: freeze the timing mode and disable all LP
+        // internal timers when the owner will be active in this context.
+        {
+            char fgt_mode[PROP_VALUE_MAX] = {0};
+            bool fgt_active = __system_property_get("debug.mks.gpu_timing",
+                                                     fgt_mode) > 0 &&
+                (!strcmp(fgt_mode, "frame") || !strcmp(fgt_mode, "frame-span") ||
+                 !strcmp(fgt_mode, "frame-count"));
+            params.mks_disable_timers = fgt_active;
+            MP_ERR(ctx, "MKS-FGPU-LP-DISABLE prop=%s active=%d\n",
+                   fgt_mode[0] ? fgt_mode : "<unset>", fgt_active ? 1 : 0);
+        }
+#endif
 # if HAVE_EGL
         params.egl_display = eglGetCurrentDisplay();
         params.egl_context = eglGetCurrentContext();

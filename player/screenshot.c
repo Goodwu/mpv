@@ -323,10 +323,9 @@ static char *gen_fname(struct mp_cmd_ctx *cmd, const char *file_ext)
     }
 }
 
-static void add_osd(struct MPContext *mpctx, struct mp_image *image, int mode)
+static void add_osd(struct MPContext *mpctx, struct mp_image *image, int mode,
+                    struct mp_osd_res res)
 {
-    struct mp_osd_res res = (mode & MODE_SCALED) ? osd_get_vo_res(mpctx->video_out->osd) :
-                            osd_res_from_image_params(&image->params);
     if (mode & MODE_SUBTITLES) {
         osd_draw_on_image(mpctx->osd, res, mpctx->video_pts,
                           OSD_DRAW_SUB_ONLY, image);
@@ -354,6 +353,11 @@ static struct mp_image *screenshot_get(struct MPContext *mpctx, int mode,
     bool scaled = mode & MODE_SCALED;
     bool subs = mode & MODE_SUBTITLES;
     bool osd = mode & MODE_OSD;
+    // A failed VO screenshot can change the shared OSD size. Use one window
+    // geometry from before that request for both software scaling and OSD.
+    struct mp_osd_res window_res = {0};
+    if (scaled)
+        window_res = osd_get_vo_res(mpctx->video_out->osd);
     struct voctrl_screenshot ctrl = {
         .scaled = scaled,
         .subs = subs,
@@ -386,6 +390,10 @@ static struct mp_image *screenshot_get(struct MPContext *mpctx, int mode,
     }
 
     if (use_sw && image && scaled) {
+        if (window_res.w <= 0 || window_res.h <= 0) {
+            talloc_free(image);
+            return NULL;
+        }
         if (mp_image_crop_valid(&image->params) &&
             (mp_rect_w(image->params.crop) != image->w ||
              mp_rect_h(image->params.crop) != image->h))
@@ -393,24 +401,28 @@ static struct mp_image *screenshot_get(struct MPContext *mpctx, int mode,
             struct mp_image *nimage = mp_image_new_ref(image);
             if (!nimage) {
                 MP_ERR(mpctx->screenshot_ctx, "mp_image_new_ref failed!\n");
+                talloc_free(image);
                 return NULL;
             }
             mp_image_crop_rc(nimage, image->params.crop);
             talloc_free(image);
             image = nimage;
         }
-        struct mp_osd_res res = osd_get_vo_res(mpctx->video_out->osd);
         struct mp_osd_res image_res = osd_res_from_image_params(&image->params);
-        if (!osd_res_equals(res, image_res)) {
-            struct mp_image *nimage = mp_image_alloc(image->imgfmt, res.w, res.h);
+        if (!osd_res_equals(window_res, image_res)) {
+            struct mp_image *nimage = mp_image_alloc(image->imgfmt, window_res.w, window_res.h);
             if (!nimage) {
                 talloc_free(image);
                 return NULL;
             }
             struct mp_sws_context *sws = mp_sws_alloc(NULL);
-            mp_sws_scale(sws, nimage, image);
+            bool ok = mp_sws_scale(sws, nimage, image) >= 0;
             talloc_free(image);
             talloc_free(sws);
+            if (!ok) {
+                talloc_free(nimage);
+                return NULL;
+            }
             image = nimage;
         }
     }
@@ -418,8 +430,11 @@ static struct mp_image *screenshot_get(struct MPContext *mpctx, int mode,
     if (!image)
         return NULL;
 
-    if (use_sw && mode != 0)
-        add_osd(mpctx, image, mode);
+    if (use_sw && mode != 0) {
+        struct mp_osd_res res = scaled ? window_res :
+                                osd_res_from_image_params(&image->params);
+        add_osd(mpctx, image, mode, res);
+    }
     mp_image_params_guess_csp(&image->params);
     return image;
 }

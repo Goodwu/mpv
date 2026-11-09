@@ -415,8 +415,10 @@ int mp_sws_scale(struct mp_sws_context *ctx, struct mp_image *dst,
     if (a_src != src)
         mp_image_copy(a_src, src);
 
-    sws_scale(ctx->sws, (const uint8_t *const *) a_src->planes, a_src->stride,
-              0, a_src->h, a_dst->planes, a_dst->stride);
+    r = sws_scale(ctx->sws, (const uint8_t *const *) a_src->planes, a_src->stride,
+                  0, a_src->h, a_dst->planes, a_dst->stride);
+    if (r < 0)
+        return r;
 
     if (a_dst != dst)
         mp_image_copy(dst, a_dst);

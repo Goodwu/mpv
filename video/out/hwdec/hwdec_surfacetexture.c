@@ -63,6 +63,7 @@
 #include "options/m_config.h"
 #include "video/out/gpu/hwdec.h"
 #include "video/out/mks_thermal.h"
+#include "video/out/mks_frame_gpu_timer.h"
 #include "video/out/mks_gpu_timer.h"
 #include "video/out/opengl/ra_gl.h"
 #include "video/mp_image.h"
@@ -204,6 +205,7 @@ struct mkst_lease {
     uint64_t latch_ts; // SurfaceTexture timestamp, ns
     GLsync fence;     // signals after the renderer is done sampling the copy
     int slot;         // index into priv->slots[]; -1 = empty
+    struct ra_hwdec_map_geometry geometry;
 };
 
 // Registry entry for a codec frame whose single explicit release has already
@@ -251,7 +253,13 @@ struct priv {
     // Identity copy program (OES sampler -> plain 2D write) and one shared
     // FBO used for every copy and the format probe.
     GLuint program;
+    // Optional target-size copy; the identity program remains the fallback.
+    GLuint program_target;
     GLuint fbo;
+
+    // Last published size, for logging changes after a successful map.
+    int logged_lease_w, logged_lease_h;
+    bool opt_lease_target;
 
     // Chosen 2D format (probed once per mapper) and the mpv imgfmt declared
     // downstream for it.
@@ -328,6 +336,20 @@ static const char mkst_fragment_src[] =
     "#version 300 es\n"
     "#extension GL_OES_EGL_image_external_essl3 : require\n"
     "precision mediump float;\n"
+    "uniform samplerExternalOES oes_tex;\n"
+    "in vec2 texcoord;\n"
+    "out vec4 frag_color;\n"
+    "void main() {\n"
+    "    frag_color = texture(oes_tex, texcoord);\n"
+    "}\n";
+
+// Target-size copy samples the OES texture over a smaller viewport. The
+// highp declaration does not establish the hardware filter precision or the
+// number of quantization steps. No color conversion is performed here.
+static const char mkst_fragment_target_src[] =
+    "#version 300 es\n"
+    "#extension GL_OES_EGL_image_external_essl3 : require\n"
+    "precision highp float;\n"
     "uniform samplerExternalOES oes_tex;\n"
     "in vec2 texcoord;\n"
     "out vec4 frag_color;\n"
@@ -578,13 +600,14 @@ static GLuint compile_shader(struct ra_hwdec_mapper *mapper, GLenum type,
     return sh;
 }
 
-static GLuint build_copy_program(struct ra_hwdec_mapper *mapper)
+static GLuint build_copy_program_fs(struct ra_hwdec_mapper *mapper,
+                                    const char *fs_src)
 {
     struct priv *p = mapper->priv;
     GL *gl = p->gl;
 
     GLuint vs = compile_shader(mapper, GL_VERTEX_SHADER, mkst_vertex_src);
-    GLuint fs = vs ? compile_shader(mapper, GL_FRAGMENT_SHADER, mkst_fragment_src)
+    GLuint fs = vs ? compile_shader(mapper, GL_FRAGMENT_SHADER, fs_src)
                    : 0;
     GLuint prog = 0;
     if (fs) {
@@ -613,6 +636,49 @@ static GLuint build_copy_program(struct ra_hwdec_mapper *mapper)
     return prog;
 }
 
+static GLuint build_copy_program(struct ra_hwdec_mapper *mapper)
+{
+    return build_copy_program_fs(mapper, mkst_fragment_src);
+}
+
+// The consumer must opt into per-map geometry and request a full-frame
+// downsample for a fresh copy. Existing leases retain their own geometry.
+static void lease_dims_for_map(struct ra_hwdec_mapper *mapper, int *tw, int *th)
+{
+    struct priv *p = mapper->priv;
+
+    int sw = mapper->src_params.w;
+    int sh = mapper->src_params.h;
+    *tw = sw;
+    *th = sh;
+    if (!p->opt_lease_target || !(mapper->caps & RA_HWDEC_CAP_MAP_GEOMETRY) ||
+        !mapper->map_request.allow_full_frame_scale)
+        return;
+
+    int dw = mapper->map_request.target_w;
+    int dh = mapper->map_request.target_h;
+    if (sw < 1 || sh < 1 || dw < 1 || dh < 1 || dw >= sw || dh >= sh)
+        return;
+    if (mapper->src_params.rotate || mapper->src_params.vflip)
+        return;
+    // Square pixels only: the gate never constructs a PAR-compensated lease
+    // (plan §7 ruling A1 — anamorphic sources fall back).
+    if (mapper->src_params.p_w != mapper->src_params.p_h)
+        return;
+    // Full-frame precondition: the crop must cover the whole source (or be
+    // unset, which the display-size derivation treats as full frame).
+    if (mp_image_crop_valid(&mapper->src_params)) {
+        struct mp_rect *c = &mapper->src_params.crop;
+        if (c->x0 || c->y0 || c->x1 != sw || c->y1 != sh)
+            return;
+    }
+    // Pure uniform scale, exact integer arithmetic.
+    if ((int64_t)sw * dh != (int64_t)sh * dw)
+        return;
+    *tw = dw;
+    *th = dh;
+}
+
 static void slot_fbo_report(struct ra_hwdec_mapper *mapper, bool final)
 {
     struct priv *p = mapper->priv;
@@ -625,12 +691,16 @@ static void slot_fbo_report(struct ra_hwdec_mapper *mapper, bool final)
                p->slot_fbo_fallbacks, p->slot_fbo_copy_failures, final);
 }
 
-// Identity copy of the current OES texture content into dst_name. The caller
-// must have latched (updateTexImage ran on this thread) beforehand.
+// Copy of the current OES texture content into dst_name. The caller must
+// have latched (updateTexImage ran on this thread) beforehand.
 // dst_fbo is a borrowed RA-owned FBO for this exact live destination texture,
 // or 0 for the original shared attachment/check path. The format probe uses 0.
+// target_copy selects the highp target-size program (viewport == lease dims
+// != source dims performs the bilinear downsample); the format probe always
+// draws the identity program regardless of its 4x4 viewport.
 static bool draw_copy(struct ra_hwdec_mapper *mapper, GLuint dst_name,
-                      GLuint dst_fbo, int w, int h, bool measure, double pts)
+                      GLuint dst_fbo, int w, int h, bool target_copy,
+                      bool measure, double pts)
 {
     struct priv *p = mapper->priv;
     GL *gl = p->gl;
@@ -661,13 +731,33 @@ static bool draw_copy(struct ra_hwdec_mapper *mapper, GLuint dst_name,
     bool ok = fbo_status == GL_FRAMEBUFFER_COMPLETE;
     if (ok) {
         gl->Viewport(0, 0, w, h);
-        gl->UseProgram(p->program);
-        gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, p->oes_tex_name);
-        bool timed = measure && mks_gpu_timer_begin(&p->gpu_copy_timer, gl,
-                                         mapper->log, "input-copy", pts);
-        gl->DrawArrays(GL_TRIANGLES, 0, 3);
-        mks_gpu_timer_end(&p->gpu_copy_timer, timed);
-        ok = gl->GetError() == GL_NO_ERROR;
+        // A target draw must never silently use the identity program.
+        if (target_copy && !p->program_target) {
+            ok = false;
+        } else {
+            gl->UseProgram(target_copy ? p->program_target : p->program);
+            gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, p->oes_tex_name);
+            bool timed = measure && mks_gpu_timer_begin(&p->gpu_copy_timer, gl,
+                                             mapper->log, "input-copy", pts);
+            int fgt_seg = -1;
+            { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+              if (fgt && mks_fgt_ready(fgt) && measure)
+                  mks_fgt_copy_begin(fgt, &fgt_seg); }
+            gl->DrawArrays(GL_TRIANGLES, 0, 3);
+            mks_gpu_timer_end(&p->gpu_copy_timer, timed);
+            { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+              if (fgt && mks_fgt_ready(fgt))
+                  mks_fgt_copy_end(fgt); }
+            ok = gl->GetError() == GL_NO_ERROR;
+            { struct mks_fgt_owner *fgt = mks_fgt_get_global();
+              if (fgt && mks_fgt_ready(fgt))
+                  mks_fgt_copy_record(fgt, pts, mapper->src_params.w,
+                                      mapper->src_params.h, w, h,
+                                      target_copy,
+                                      ok ? "seg" : (measure ? "refused:draw_err" : "none:pre_draw"),
+                                      ok ? fgt_seg : -1,
+                                      ok); }
+        }
     }
     gl->BindTexture(GL_TEXTURE_EXTERNAL_OES, old_oes);
     gl->BindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)old_read_fbo);
@@ -702,14 +792,13 @@ static bool draw_copy(struct ra_hwdec_mapper *mapper, GLuint dst_name,
 // No-op unless the bridge exports mkst_diag_enabled() and it returns
 // non-zero.
 static void mkst_diag_readback(struct ra_hwdec_mapper *mapper, GLuint tex_name,
-                               double pts)
+                               int width, int height, double pts)
 {
     struct priv *p = mapper->priv;
     GL *gl = p->gl;
 
-    // One-strike short circuit: after a failed readback this entry point
-    // must not touch GL state again (it runs every map).
-    if (p->diag_readback_unsupported)
+    // Keep the fixed 8x8 diagnostic inside the actual texture.
+    if (p->diag_readback_unsupported || width < 8 || height < 8)
         return;
 
     GLint old_read_fbo = 0, old_draw_fbo = 0;
@@ -722,8 +811,8 @@ static void mkst_diag_readback(struct ra_hwdec_mapper *mapper, GLuint tex_name,
     gl->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                              GL_TEXTURE_2D, tex_name, 0);
 
-    int x0 = (int)mapper->src_params.w / 2 - 4;
-    int y0 = (int)mapper->src_params.h / 2 - 4;
+    int x0 = width / 2 - 4;
+    int y0 = height / 2 - 4;
     if (x0 < 0)
         x0 = 0;
     if (y0 < 0)
@@ -768,7 +857,8 @@ static void mkst_diag_readback(struct ra_hwdec_mapper *mapper, GLuint tex_name,
 // attached to an FBO and the identity copy is actually drawn. FBO
 // completeness plus a clean GetError are the renderable evidence; filterable
 // evidence comes from ra_format.linear_filter (required before probing).
-static bool probe_draw(struct ra_hwdec_mapper *mapper, const struct ra_format *fmt)
+static bool probe_draw(struct ra_hwdec_mapper *mapper, const struct ra_format *fmt,
+                       bool target_copy)
 {
     struct ra_tex_params params = {
         .dimensions = 2,
@@ -784,7 +874,7 @@ static bool probe_draw(struct ra_hwdec_mapper *mapper, const struct ra_format *f
     GLuint name = 0;
     GLenum target = 0;
     ra_gl_get_raw_tex(mapper->ra, tex, &name, &target);
-    bool ok = draw_copy(mapper, name, 0, 4, 4, false, NAN);
+    bool ok = draw_copy(mapper, name, 0, 4, 4, target_copy, false, NAN);
     ra_tex_free(mapper->ra, &tex);
     return ok;
 }
@@ -836,7 +926,7 @@ static const struct ra_format *probe_2d_format(struct ra_hwdec_mapper *mapper)
                             fmt->linear_filter);
             continue;
         }
-        if (!probe_draw(mapper, fmt)) {
+        if (!probe_draw(mapper, fmt, false)) {
             MP_INFO(mapper, "MKSURF: format candidate %s rejected (real FBO draw "
                             "failed)\n", names[idx]);
             continue;
@@ -876,6 +966,15 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
     if (__system_property_get("debug.mks.st_lease_rgba16", lease_fmt) > 0 &&
         !strcmp(lease_fmt, "1"))
         p->lease_rgba16_pref = true;
+    // The property alone cannot change geometry for an unadapted consumer.
+    char lease_target[PROP_VALUE_MAX] = {0};
+    if (__system_property_get("debug.mks.st_lease_target", lease_target) > 0 &&
+        !strcmp(lease_target, "1")) {
+        p->opt_lease_target = mapper->caps & RA_HWDEC_CAP_MAP_GEOMETRY;
+        if (!p->opt_lease_target)
+            MP_ERR(mapper, "MKSURF: target-size unsupported by consumer; "
+                           "using source-size lease\n");
+    }
     char slot_fbo[PROP_VALUE_MAX] = {0};
     if (__system_property_get("debug.mks.st_fbo", slot_fbo) > 0) {
         if (!strcmp(slot_fbo, "0") || !strcmp(slot_fbo, "1")) {
@@ -972,6 +1071,16 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
     p->fmt = probe_2d_format(mapper);
     if (!p->fmt)
         return -1;
+
+    if (p->opt_lease_target) {
+        p->program_target = build_copy_program_fs(mapper,
+                                                  mkst_fragment_target_src);
+        if (!p->program_target || !probe_draw(mapper, p->fmt, true)) {
+            MP_ERR(mapper, "MKSURF: target-size program probe failed; "
+                           "using source-size lease\n");
+            p->opt_lease_target = false;
+        }
+    }
 
     p->have_fence = gl->FenceSync && gl->ClientWaitSync &&
                     gl->DeleteSync && gl->Flush;
@@ -1213,6 +1322,22 @@ static void retire_reap(struct ra_hwdec_mapper *mapper, int max_keep)
     }
 }
 
+static void mapper_publish_lease(struct ra_hwdec_mapper *mapper)
+{
+    struct priv *p = mapper->priv;
+    struct mkst_lease *lease = &p->cur;
+    struct mkst_slot *slot = &p->slots[lease->slot];
+    mapper->tex[0] = slot->tex;
+    if (mapper->caps & RA_HWDEC_CAP_MAP_GEOMETRY)
+        mapper->map_geometry = lease->geometry;
+    if (p->logged_lease_w != slot->w || p->logged_lease_h != slot->h) {
+        p->logged_lease_w = slot->w;
+        p->logged_lease_h = slot->h;
+        MP_ERR(mapper, "MKSURF: lease published %dx%d (src %dx%d)\n",
+               slot->w, slot->h, mapper->src_params.w, mapper->src_params.h);
+    }
+}
+
 // Take a retired lease back as the current mapping for a redraw of a frame
 // whose codec buffer was already released (and possibly retired). Whatever
 // the mapper currently holds is released first.
@@ -1233,15 +1358,13 @@ static void mapper_adopt_retired(struct ra_hwdec_mapper *mapper, int index)
 
     // Ownership of lease (incl. its source ref) transfers to cur.
     p->cur = lease;
-    mapper->tex[0] = p->slots[lease.slot].tex;
+    mapper_publish_lease(mapper);
 }
 
 // Find a free pool slot (not held by cur or any retired lease) and make sure
 // its texture exists with the current source dimensions.
-static int take_slot(struct ra_hwdec_mapper *mapper){
+static int take_slot(struct ra_hwdec_mapper *mapper, int w, int h){
     struct priv *p = mapper->priv;
-    int w = mapper->src_params.w;
-    int h = mapper->src_params.h;
 
     for (int i = 0; i < MKSURF_POOL_SIZE; i++) {
         if (p->cur.slot == i)
@@ -1323,7 +1446,7 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     // a) Current lease (defensive: unmap normally runs before every map, so
     //    cur is usually empty here).
     if (p->cur.slot >= 0 && lease_matches(&p->cur, mapper->src)) {
-        mapper->tex[0] = p->slots[p->cur.slot].tex;
+        mapper_publish_lease(mapper);
         if (p->thermal.enabled) {
             p->thermal.lease_reuse++;
             p->thermal.pts = src_pts;
@@ -1368,7 +1491,7 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     // The reap above cannot create matches (a/b just found none), but a
     // lease serve always beats an idempotent re-release, so verify once more.
     if (p->cur.slot >= 0 && lease_matches(&p->cur, mapper->src)) {
-        mapper->tex[0] = p->slots[p->cur.slot].tex;
+        mapper_publish_lease(mapper);
         return 0;
     }
     ridx = retired_find(p, mapper->src);
@@ -1495,9 +1618,16 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
         return -1;
     }
 
-    int slot = take_slot(mapper);
-    if (slot < 0)
+    int lease_w, lease_h;
+    lease_dims_for_map(mapper, &lease_w, &lease_h);
+    bool target_copy = lease_w != mapper->src_params.w ||
+                       lease_h != mapper->src_params.h;
+    int slot = take_slot(mapper, lease_w, lease_h);
+    if (slot < 0) {
+        if (target_copy)
+            p->opt_lease_target = false;
         return -1;
+    }
     GLuint dst_fbo = 0;
     if (p->slot_fbo_reuse &&
         !ra_gl_get_owned_fbo(mapper->ra, p->slots[slot].tex, &dst_fbo))
@@ -1506,9 +1636,12 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     // borrowed name across slot recreation. A getter refusal is a pre-draw
     // fallback; a copy error must still fail this map without publishing or
     // retrying the already consumed codec frame.
-    if (!draw_copy(mapper, p->slots[slot].name, dst_fbo, mapper->src_params.w,
-                   mapper->src_params.h, true, src_pts))
+    if (!draw_copy(mapper, p->slots[slot].name, dst_fbo, lease_w, lease_h,
+                   target_copy, true, src_pts)) {
+        if (target_copy)
+            p->opt_lease_target = false;
         return -1;
+    }
     if (p->thermal.enabled) {
         p->thermal.lease_copy++;
         p->thermal.pts = src_pts;
@@ -1521,7 +1654,7 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     // attempt), then the bridge runtime switch, double-checked (pointer +
     // call).
     if (!p->diag_readback_unsupported && o->diag_enabled && o->diag_enabled())
-        mkst_diag_readback(mapper, p->slots[slot].name, src_pts);
+        mkst_diag_readback(mapper, p->slots[slot].name, lease_w, lease_h, src_pts);
 #endif
 
     p->cur = (struct mkst_lease) {
@@ -1530,6 +1663,13 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
         .latch_ts = ts_ns,
         .fence = NULL,
         .slot = slot,
+        .geometry = {
+            .valid = true,
+            .logical_w = mapper->src_params.w,
+            .logical_h = mapper->src_params.h,
+            .logical_rect = {0, 0, mapper->src_params.w, mapper->src_params.h},
+            .mapped_rect = {0, 0, lease_w, lease_h},
+        },
     };
     if (!p->cur.source) {
         p->cur.slot = MKSURF_NO_SLOT;
@@ -1580,7 +1720,7 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     if (in_use > (int)p->pool_peak)
         p->pool_peak = in_use;
 
-    mapper->tex[0] = p->slots[slot].tex;
+    mapper_publish_lease(mapper);
 
     MP_INFO(mapper, "MKSURF: frame latch_ts=%"PRIu64"ns src_pts=%.9f delta=%.6fs "
                     "release_count=%"PRIu64" pool=%d/%"PRIu64" fence=%d\n",
@@ -1658,6 +1798,9 @@ static void mapper_uninit(struct ra_hwdec_mapper *mapper)
     if (p->program)
         gl->DeleteProgram(p->program);
     p->program = 0;
+    if (p->program_target)
+        gl->DeleteProgram(p->program_target);
+    p->program_target = 0;
 
     // Drop only the wrapped view: the OES GL name is deleted at the owner
     // level (hwdec uninit) so mapper rebuilds always find it alive.
